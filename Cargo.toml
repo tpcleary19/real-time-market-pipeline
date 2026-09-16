@@ -1,0 +1,10 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/market-events",
+    "crates/market-producer",
+    "crates/market-consumer",
+    "crates/query-api",
+    "crates/portfolio-domain",
+    "crates/load-generator",
+]
