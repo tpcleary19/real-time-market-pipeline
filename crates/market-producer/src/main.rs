@@ -1,7 +1,11 @@
 use dotenvy::dotenv;
 use futures_util::{SinkExt, StreamExt};
+use rdkafka::{
+    config::ClientConfig,
+    producer::{FutureProducer, FutureRecord},
+};
 use serde_json::json;
-use std::env;
+use std::{env, time::Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 #[tokio::main]
@@ -11,8 +15,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let api_key = env::var("APCA_API_KEY_ID")?;
     let api_secret = env::var("APCA_API_SECRET_KEY")?;
-    let feed = env::var("ALPACA_FEED")
-        .unwrap_or_else(|_| "iex".to_string());
+    let feed = env::var("ALPACA_FEED").unwrap_or_else(|_| "iex".to_string());
 
     let symbols = env::var("ALPACA_SYMBOLS")
         .unwrap_or_else(|_| "AAPL".to_string())
@@ -21,6 +24,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect::<Vec<_>>();
 
     let url = format!("wss://stream.data.alpaca.markets/v2/{feed}");
+
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", "localhost:9092")
+        .create()?;
+
+    println!("Kafka producer configured.");
 
     println!("Connecting to Alpaca {feed} feed...");
 
@@ -35,9 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "secret": api_secret
     });
 
-    socket
-        .send(Message::Text(auth.to_string().into()))
-        .await?;
+    socket.send(Message::Text(auth.to_string().into())).await?;
 
     // Subscribe to trade events.
     let subscribe = json!({
@@ -56,6 +63,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match message? {
             Message::Text(text) => {
                 println!("{text}");
+
+                let events: serde_json::Value = serde_json::from_str(&text)?;
+
+                if let Some(events) = events.as_array() {
+                    for event in events {
+                        // Alpaca uses "t" for a trade event.
+                        if event.get("T").and_then(|v| v.as_str()) == Some("t") {
+                            let payload = serde_json::to_string(event)?;
+
+                            let symbol =
+                                event.get("S").and_then(|v| v.as_str()).unwrap_or("UNKNOWN");
+
+                            producer
+                                .send(
+                                    FutureRecord::to("stock-trades")
+                                        .key(symbol)
+                                        .payload(&payload),
+                                    Duration::from_secs(5),
+                                )
+                                .await
+                                .map_err(|(e, _)| e)?;
+
+                            println!("Kafka <- {symbol}: {payload}");
+                        }
+                    }
+                }
             }
 
             Message::Ping(data) => {
