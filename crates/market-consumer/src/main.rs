@@ -4,6 +4,7 @@ use rdkafka::{
     consumer::{CommitMode, Consumer, StreamConsumer},
     message::Message,
 };
+use redis::AsyncCommands;
 use serde::Deserialize;
 use sqlx::postgres::PgPoolOptions;
 
@@ -41,6 +42,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     println!("Connected to Postgres.");
+    let redis_client = redis::Client::open("redis://127.0.0.1/")?;
+
+    let mut redis_connection = redis_client.get_multiplexed_async_connection().await?;
+
+    println!("Connected to Redis.");
 
     let consumer: StreamConsumer = ClientConfig::new()
         .set("group.id", "market-consumer")
@@ -108,8 +114,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(_) => {
                 println!("Postgres <- {}", trade.symbol);
 
-                if let Err(error) = consumer.commit_message(&message, CommitMode::Async) {
-                    eprintln!("Kafka commit failed: {error}");
+                // Update Redis only after Postgres succeeded.
+                let redis_key = format!("latest:{}", trade.symbol);
+
+                let redis_result: redis::RedisResult<()> = redis_connection
+                    .hset_multiple(
+                        &redis_key,
+                        &[
+                            ("trade_id", trade.trade_id.to_string()),
+                            ("price", trade.price.to_string()),
+                            ("size", trade.size.to_string()),
+                            ("timestamp", trade.timestamp.clone()),
+                            ("exchange", trade.exchange.clone().unwrap_or_default()),
+                            ("tape", trade.tape.clone().unwrap_or_default()),
+                        ],
+                    )
+                    .await;
+
+                match redis_result {
+                    Ok(_) => {
+                        println!("Redis <- {}", trade.symbol);
+
+                        // Only commit after BOTH Postgres and Redis succeeded.
+                        if let Err(error) = consumer.commit_message(&message, CommitMode::Async) {
+                            eprintln!("Kafka commit failed: {error}");
+                        }
+                    }
+
+                    Err(error) => {
+                        eprintln!("Redis update failed for {}: {}", trade.symbol, error);
+                    }
                 }
             }
 
