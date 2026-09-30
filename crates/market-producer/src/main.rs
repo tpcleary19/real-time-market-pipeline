@@ -31,78 +31,99 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Kafka producer configured.");
 
-    println!("Connecting to Alpaca {feed} feed...");
+    loop {
+        println!("Connecting to Alpaca {feed} feed...");
 
-    let (mut socket, _) = connect_async(&url).await?;
+        let (mut socket, _) = match connect_async(&url).await {
+            Ok(connection) => connection,
 
-    println!("WebSocket connected.");
+            Err(error) => {
+                eprintln!("Alpaca connection failed: {error}");
+                eprintln!("Retrying in 5 seconds...");
 
-    // Authenticate with Alpaca.
-    let auth = json!({
-        "action": "auth",
-        "key": api_key,
-        "secret": api_secret
-    });
+                tokio::time::sleep(Duration::from_secs(5)).await;
 
-    socket.send(Message::Text(auth.to_string().into())).await?;
+                continue;
+            }
+        };
 
-    // Subscribe to trade events.
-    let subscribe = json!({
-        "action": "subscribe",
-        "trades": symbols
-    });
+        println!("WebSocket connected.");
 
-    socket
-        .send(Message::Text(subscribe.to_string().into()))
-        .await?;
+        // Authenticate with Alpaca.
+        let auth = json!({
+            "action": "auth",
+            "key": api_key,
+            "secret": api_secret
+        });
 
-    println!("Subscription request sent.");
-    println!("Waiting for Alpaca messages...");
+        socket.send(Message::Text(auth.to_string().into())).await?;
 
-    while let Some(message) = socket.next().await {
-        match message? {
-            Message::Text(text) => {
-                println!("{text}");
+        // Subscribe to trade events.
+        let subscribe = json!({
+            "action": "subscribe",
+            "trades": symbols
+        });
 
-                let events: serde_json::Value = serde_json::from_str(&text)?;
+        socket
+            .send(Message::Text(subscribe.to_string().into()))
+            .await?;
 
-                if let Some(events) = events.as_array() {
-                    for event in events {
-                        // Alpaca uses "t" for a trade event.
-                        if event.get("T").and_then(|v| v.as_str()) == Some("t") {
-                            let payload = serde_json::to_string(event)?;
+        println!("Subscription request sent.");
+        println!("Waiting for Alpaca messages...");
 
-                            let symbol =
-                                event.get("S").and_then(|v| v.as_str()).unwrap_or("UNKNOWN");
+        while let Some(message) = socket.next().await {
+            match message {
+                Ok(message) => match message {
+                    Message::Text(text) => {
+                        println!("{text}");
 
-                            producer
-                                .send(
-                                    FutureRecord::to("stock-trades")
-                                        .key(symbol)
-                                        .payload(&payload),
-                                    Duration::from_secs(5),
-                                )
-                                .await
-                                .map_err(|(e, _)| e)?;
+                        let events: serde_json::Value = serde_json::from_str(&text)?;
 
-                            println!("Kafka <- {symbol}: {payload}");
+                        if let Some(events) = events.as_array() {
+                            for event in events {
+                                // Alpaca uses "t" for a trade event.
+                                if event.get("T").and_then(|v| v.as_str()) == Some("t") {
+                                    let payload = serde_json::to_string(event)?;
+
+                                    let symbol = event
+                                        .get("S")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("UNKNOWN");
+
+                                    producer
+                                        .send(
+                                            FutureRecord::to("stock-trades")
+                                                .key(symbol)
+                                                .payload(&payload),
+                                            Duration::from_secs(5),
+                                        )
+                                        .await
+                                        .map_err(|(e, _)| e)?;
+
+                                    println!("Kafka <- {symbol}: {payload}");
+                                }
+                            }
                         }
                     }
+
+                    Message::Ping(data) => {
+                        socket.send(Message::Pong(data)).await?;
+                    }
+
+                    Message::Close(frame) => {
+                        println!("Alpaca closed connection: {frame:?}");
+                        break;
+                    }
+
+                    _ => {}
+                },
+                Err(error) => {
+                    eprintln!("Alpaca WebSocket error: {error}");
+                    break;
                 }
             }
-
-            Message::Ping(data) => {
-                socket.send(Message::Pong(data)).await?;
-            }
-
-            Message::Close(frame) => {
-                println!("Alpaca closed connection: {frame:?}");
-                break;
-            }
-
-            _ => {}
         }
+        println!("Alpaca connection ended. Reconnecting in 5 seconds....");
+        tokio::time::sleep(Duration::from_secs(5)).await;
     }
-
-    Ok(())
 }
