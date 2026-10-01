@@ -1,3 +1,4 @@
+use chrono::Local;
 use dotenvy::dotenv;
 use futures_util::{SinkExt, StreamExt};
 use rdkafka::{
@@ -7,7 +8,6 @@ use rdkafka::{
 use serde_json::json;
 use std::{env, time::Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use chrono::Local;
 
 fn timestamp() -> String {
     Local::now().format("%m-%d %H:%M:%S").to_string()
@@ -126,7 +126,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        println!("{} Alpaca connection ended. Reconnecting in 5 seconds....", timestamp());
+        println!(
+            "{} Alpaca connection ended. Reconnecting in 5 seconds....",
+            timestamp()
+        );
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }

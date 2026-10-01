@@ -927,7 +927,11 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 name = "load-generator"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "market-events",
+ "rdkafka 0.38.0",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -951,7 +955,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "futures-util",
- "rdkafka",
+ "rdkafka 0.39.0",
  "redis",
  "serde",
  "serde_json",
@@ -970,7 +974,7 @@ dependencies = [
  "chrono",
  "dotenvy",
  "futures-util",
- "rdkafka",
+ "rdkafka 0.39.0",
  "serde",
  "serde_json",
  "tokio",
@@ -1252,6 +1256,24 @@ name = "rand_core"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
+
+[[package]]
+name = "rdkafka"
+version = "0.38.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f1856d72dbbbea0d2a5b2eaf6af7fb3847ef2746e883b11781446a51dbc85c0"
+dependencies = [
+ "futures-channel",
+ "futures-util",
+ "libc",
+ "log",
+ "rdkafka-sys",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "slab",
+ "tokio",
+]
 
 [[package]]
 name = "rdkafka"

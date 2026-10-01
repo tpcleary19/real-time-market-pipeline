@@ -1,3 +1,4 @@
+use chrono::Local;
 use futures_util::StreamExt;
 use rdkafka::{
     config::ClientConfig,
@@ -7,12 +8,10 @@ use rdkafka::{
 use redis::AsyncCommands;
 use serde::Deserialize;
 use sqlx::postgres::PgPoolOptions;
-use chrono::Local;
 
 fn timestamp() -> String {
     Local::now().format("%m-%d %H:%M:%S").to_string()
 }
-
 
 #[derive(Debug, Deserialize)]
 struct Trade {
@@ -93,7 +92,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         println!(
             "{} Kafka -> {} price={} size={}",
-             timestamp(), trade.symbol, trade.price, trade.size
+            timestamp(),
+            trade.symbol,
+            trade.price,
+            trade.size
         );
         let result = sqlx::query(
             r#"
@@ -148,13 +150,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     Err(error) => {
-                        eprintln!("{} Redis update failed for {}: {}", timestamp(), trade.symbol, error);
+                        eprintln!(
+                            "{} Redis update failed for {}: {}",
+                            timestamp(),
+                            trade.symbol,
+                            error
+                        );
                     }
                 }
             }
 
             Err(error) => {
-                eprintln!("{} Postgres insert failed for {}: {}", timestamp(), trade.symbol, error);
+                eprintln!(
+                    "{} Postgres insert failed for {}: {}",
+                    timestamp(),
+                    trade.symbol,
+                    error
+                );
             }
         }
     }
