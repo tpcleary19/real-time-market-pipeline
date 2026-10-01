@@ -27,9 +27,10 @@ async fn main() {
     let mut batch = Vec::new();
     for offset in 1..trade_count {
         let trade_id = starting_trade_id + offset;
+        let symbol = format!("LOAD{}", offset % 12);
         let trade = json!({
             "T": "t",
-            "S": "LOAD",
+            "S": &symbol,
             "i": trade_id,
             "p": 250.25,
             "s": 100,
@@ -45,7 +46,7 @@ async fn main() {
             producer
                 .send(
                     FutureRecord::to("stock-trades")
-                        .key("LOAD")
+                        .key(&symbol)
                         .payload(&payload),
                     Duration::from_secs(5),
                 )

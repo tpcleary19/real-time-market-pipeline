@@ -350,3 +350,17 @@ Consumer:
 - ~385 messages/sec sustained
 - Postgres average: ~1.97 ms/trade
 - Redis average: ~0.55 ms/trade
+
+
+Single partition / single consumer:
+~385 trades/sec
+
+Three partitions / three consumers:
+~1,000 trades/sec aggregate
+
+Scaling improvement:
+~2.6×
+
+Observed bottleneck shift:
+Postgres latency increased from ~1.97 ms to ~2.4 ms
+under three-consumer load, while Redis remained ~0.55 ms.
