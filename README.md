@@ -334,3 +334,15 @@ The goal is not just to move stock prices between technologies. The project is i
 - containerized local development
 - eventual cloud deployment
 
+## Performance Baseline
+
+Initial single-partition load test:
+
+- Synthetic trades: 50,000
+- Kafka partitions: 1
+- Load-generator throughput: ~13,146 messages/sec
+- Peak observed consumer lag: 49,133 messages
+- Consumer sustained drain rate: ~175 messages/sec
+- Consumer processing: sequential Postgres write → Redis update → Kafka offset commit
+
+This baseline is intentionally unoptimized and will be used to measure subsequent consumer improvements.
