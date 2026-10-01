@@ -7,6 +7,12 @@ use rdkafka::{
 use redis::AsyncCommands;
 use serde::Deserialize;
 use sqlx::postgres::PgPoolOptions;
+use chrono::Local;
+
+fn timestamp() -> String {
+    Local::now().format("%m-%d %H:%M:%S").to_string()
+}
+
 
 #[derive(Debug, Deserialize)]
 struct Trade {
@@ -41,12 +47,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .connect(database_url)
         .await?;
 
-    println!("Connected to Postgres.");
+    println!("{} Connected to Postgres.", timestamp());
     let redis_client = redis::Client::open("redis://127.0.0.1/")?;
 
     let mut redis_connection = redis_client.get_multiplexed_async_connection().await?;
 
-    println!("Connected to Redis.");
+    println!("{} Connected to Redis.", timestamp());
 
     let consumer: StreamConsumer = ClientConfig::new()
         .set("group.id", "market-consumer")
@@ -57,7 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     consumer.subscribe(&["stock-trades"])?;
 
-    println!("Subscribed to Kafka topic stock-trades.");
+    println!("{} Subscribed to Kafka topic stock-trades.", timestamp());
 
     let mut stream = consumer.stream();
 
@@ -65,7 +71,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let message = match message {
             Ok(message) => message,
             Err(error) => {
-                eprintln!("Kafka error: {error}");
+                eprintln!("{} Kafka error: {error}", timestamp());
                 continue;
             }
         };
@@ -79,15 +85,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let trade: Trade = match serde_json::from_str(payload) {
             Ok(trade) => trade,
             Err(error) => {
-                eprintln!("Invalid trade: {error}");
-                eprintln!("Payload: {payload}");
+                eprintln!("{} Invalid trade: {error}", timestamp());
+                eprintln!("{} Payload: {payload}", timestamp());
                 continue;
             }
         };
 
         println!(
-            "Kafka -> {} price={} size={}",
-            trade.symbol, trade.price, trade.size
+            "{} Kafka -> {} price={} size={}",
+             timestamp(), trade.symbol, trade.price, trade.size
         );
         let result = sqlx::query(
             r#"
@@ -112,7 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         match result {
             Ok(_) => {
-                println!("Postgres <- {}", trade.symbol);
+                println!("{} Postgres <- {}", timestamp(), trade.symbol);
 
                 // Update Redis only after Postgres succeeded.
                 let redis_key = format!("latest:{}", trade.symbol);
@@ -133,22 +139,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 match redis_result {
                     Ok(_) => {
-                        println!("Redis <- {}", trade.symbol);
+                        println!("{} Redis <- {}", timestamp(), trade.symbol);
 
                         // Only commit after BOTH Postgres and Redis succeeded.
                         if let Err(error) = consumer.commit_message(&message, CommitMode::Async) {
-                            eprintln!("Kafka commit failed: {error}");
+                            eprintln!("{} Kafka commit failed: {error}", timestamp());
                         }
                     }
 
                     Err(error) => {
-                        eprintln!("Redis update failed for {}: {}", trade.symbol, error);
+                        eprintln!("{} Redis update failed for {}: {}", timestamp(), trade.symbol, error);
                     }
                 }
             }
 
             Err(error) => {
-                eprintln!("Postgres insert failed for {}: {}", trade.symbol, error);
+                eprintln!("{} Postgres insert failed for {}: {}", timestamp(), trade.symbol, error);
             }
         }
     }

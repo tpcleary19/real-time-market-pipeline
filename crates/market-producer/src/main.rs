@@ -7,6 +7,11 @@ use rdkafka::{
 use serde_json::json;
 use std::{env, time::Duration};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+use chrono::Local;
+
+fn timestamp() -> String {
+    Local::now().format("%m-%d %H:%M:%S").to_string()
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -29,7 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .set("bootstrap.servers", "localhost:9092")
         .create()?;
 
-    println!("Kafka producer configured.");
+    println!("{} Kafka producer configured.", timestamp());
 
     loop {
         println!("Connecting to Alpaca {feed} feed...");
@@ -38,8 +43,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(connection) => connection,
 
             Err(error) => {
-                eprintln!("Alpaca connection failed: {error}");
-                eprintln!("Retrying in 5 seconds...");
+                eprintln!("{} Alpaca connection failed: {error}", timestamp());
+                eprintln!("{} Retrying in 5 seconds...", timestamp());
 
                 tokio::time::sleep(Duration::from_secs(5)).await;
 
@@ -47,7 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        println!("WebSocket connected.");
+        println!("{} WebSocket connected.", timestamp());
 
         // Authenticate with Alpaca.
         let auth = json!({
@@ -75,8 +80,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match message {
                 Ok(message) => match message {
                     Message::Text(text) => {
-                        println!("{text}");
-
                         let events: serde_json::Value = serde_json::from_str(&text)?;
 
                         if let Some(events) = events.as_array() {
@@ -100,7 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         .await
                                         .map_err(|(e, _)| e)?;
 
-                                    println!("Kafka <- {symbol}: {payload}");
+                                    println!("{} Kafka <- {symbol}: {payload}", timestamp());
                                 }
                             }
                         }
@@ -111,19 +114,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     Message::Close(frame) => {
-                        println!("Alpaca closed connection: {frame:?}");
+                        println!("{} Alpaca closed connection: {frame:?}", timestamp());
                         break;
                     }
 
                     _ => {}
                 },
                 Err(error) => {
-                    eprintln!("Alpaca WebSocket error: {error}");
+                    eprintln!("{} Alpaca WebSocket error: {error}", timestamp());
                     break;
                 }
             }
         }
-        println!("Alpaca connection ended. Reconnecting in 5 seconds....");
+        println!("{} Alpaca connection ended. Reconnecting in 5 seconds....", timestamp());
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }
