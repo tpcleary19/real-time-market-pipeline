@@ -8,6 +8,7 @@ use rdkafka::{
 use redis::AsyncCommands;
 use serde::Deserialize;
 use sqlx::postgres::PgPoolOptions;
+use std::time::Instant;
 
 fn timestamp() -> String {
     Local::now().format("%m-%d %H:%M:%S").to_string()
@@ -62,10 +63,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     consumer.subscribe(&["stock-trades"])?;
 
-    println!("{} Subscribed to Kafka topic stock-trades.", timestamp());
+    //    println!("{} Subscribed to Kafka topic stock-trades.", timestamp());
 
     let mut stream = consumer.stream();
-
+    let mut trade_count: u64 = 0;
+    let mut postgres_total_us: u128 = 0;
+    let mut redis_total_us: u128 = 0;
+    let mut batch_start = Instant::now();
     while let Some(message) = stream.next().await {
         let message = match message {
             Ok(message) => message,
@@ -90,13 +94,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        println!(
+        /*        println!(
             "{} Kafka -> {} price={} size={}",
             timestamp(),
             trade.symbol,
             trade.price,
             trade.size
-        );
+        );*/
+        let postgres_start = Instant::now();
         let result = sqlx::query(
             r#"
             INSERT INTO trades
@@ -118,13 +123,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .execute(&pool)
         .await;
 
+        let postgres_elapsed = postgres_start.elapsed();
+        if postgres_elapsed.as_millis() > 20 {
+            println!("{} SLOW Postgres: {:?}", timestamp(), postgres_elapsed);
+        }
+        postgres_total_us += postgres_elapsed.as_micros();
         match result {
             Ok(_) => {
-                println!("{} Postgres <- {}", timestamp(), trade.symbol);
+                //                println!("{} Postgres <- {}", timestamp(), trade.symbol);
 
                 // Update Redis only after Postgres succeeded.
                 let redis_key = format!("latest:{}", trade.symbol);
-
+                let redis_start = Instant::now();
                 let redis_result: redis::RedisResult<()> = redis_connection
                     .hset_multiple(
                         &redis_key,
@@ -138,6 +148,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ],
                     )
                     .await;
+                let redis_elapsed = redis_start.elapsed();
+
+                if redis_elapsed.as_millis() > 20 {
+                    println!("{} SLOW Redis: {:?}", timestamp(), redis_elapsed);
+                }
+
+                redis_total_us += redis_elapsed.as_micros();
+                trade_count += 1;
 
                 match redis_result {
                     Ok(_) => {
@@ -168,6 +186,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     error
                 );
             }
+        }
+        if trade_count % 1000 == 0 {
+            let batch_elapsed = batch_start.elapsed().as_secs_f64();
+            let throughput = 1000.0 / batch_elapsed;
+            println!(
+                "{} STATS trades={} throughput={:.0}/sec postgres_avg={:.2}ms redis_avg={:.2}ms",
+                timestamp(),
+                trade_count,
+                throughput,
+                postgres_total_us as f64 / trade_count as f64 / 1000.0,
+                redis_total_us as f64 / trade_count as f64 / 1000.0,
+            );
+            batch_start = Instant::now();
         }
     }
 

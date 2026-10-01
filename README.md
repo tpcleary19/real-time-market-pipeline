@@ -338,11 +338,15 @@ The goal is not just to move stock prices between technologies. The project is i
 
 Initial single-partition load test:
 
-- Synthetic trades: 50,000
-- Kafka partitions: 1
-- Load-generator throughput: ~13,146 messages/sec
-- Peak observed consumer lag: 49,133 messages
-- Consumer sustained drain rate: ~175 messages/sec
-- Consumer processing: sequential Postgres write → Redis update → Kafka offset commit
+50,000-message synthetic load test
 
-This baseline is intentionally unoptimized and will be used to measure subsequent consumer improvements.
+Load generator:
+- ~13,000–14,000 messages/sec
+
+Consumer:
+- 1 Kafka partition
+- 1 consumer
+- Sequential processing
+- ~385 messages/sec sustained
+- Postgres average: ~1.97 ms/trade
+- Redis average: ~0.55 ms/trade
