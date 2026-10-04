@@ -3,12 +3,12 @@ use futures_util::StreamExt;
 use rdkafka::{
     config::ClientConfig,
     consumer::{CommitMode, Consumer, StreamConsumer},
-    message::Message,
+    message::{Message, OwnedMessage},
 };
 use redis::AsyncCommands;
 use serde::Deserialize;
 use sqlx::postgres::PgPoolOptions;
-use std::time::Instant;
+use tokio::time::{Duration, Instant};
 
 fn timestamp() -> String {
     Local::now().format("%m-%d %H:%M:%S").to_string()
@@ -65,11 +65,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     //    println!("{} Subscribed to Kafka topic stock-trades.", timestamp());
 
+    let mut batch: Vec<OwnedMessage> = Vec::new();
     let mut stream = consumer.stream();
     let mut trade_count: u64 = 0;
     let mut postgres_total_us: u128 = 0;
     let mut redis_total_us: u128 = 0;
     let mut batch_start = Instant::now();
+    let mut received: u64 = 0;
+    let mut flushed: u64 = 0;
     while let Some(message) = stream.next().await {
         let message = match message {
             Ok(message) => message,
@@ -78,6 +81,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
         };
+
+        loop {
+            if batch.is_empty() {
+                match stream.next().await {
+                    Some(Ok(message)) => {
+                        batch.push(message.detach());
+                        received += 1;
+                    }
+                    Some(Err(error)) => {
+                        eprintln!("{} Kafka error: {error}", timestamp());
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+
+            let deadline = Instant::now() + Duration::from_millis(100);
+
+            while batch.len() < 100 {
+                tokio::select! {
+                    message = stream.next() => {
+                        match message {
+                            Some(Ok(message)) => {
+                                batch.push(message.detach());
+                                received += 1;
+                            }
+
+                            Some(Err(error)) => {
+                                eprintln!("{} Kafka error: {error}", timestamp());
+                            }
+
+                            None => break,
+                        }
+                    }
+
+                    _ = tokio::time::sleep_until(deadline) => {
+                        break;
+                    }
+                }
+            }
+            flushed += batch.len() as u64;
+            println!(
+                "{} BATCH size={} received={} flushed={}",
+                timestamp(),
+                batch.len(),
+                received,
+                flushed
+            );
+            batch.clear();
+        }
 
         let Some(payload) = message.payload_view::<str>() else {
             continue;

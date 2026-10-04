@@ -25,7 +25,7 @@ async fn main() {
 
     let start = Instant::now();
     let mut batch = Vec::new();
-    for offset in 1..trade_count {
+    for offset in 0..trade_count {
         let trade_id = starting_trade_id + offset;
         let symbol = format!("LOAD{}", offset % 12);
         let trade = json!({
