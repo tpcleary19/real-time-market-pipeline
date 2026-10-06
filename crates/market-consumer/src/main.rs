@@ -7,7 +7,7 @@ use rdkafka::{
 };
 use redis::AsyncCommands;
 use serde::Deserialize;
-use sqlx::postgres::PgPoolOptions;
+use sqlx::{Postgres, QueryBuilder, postgres::PgPoolOptions};
 use tokio::time::{Duration, Instant};
 
 fn timestamp() -> String {
@@ -29,13 +29,95 @@ struct Trade {
     size: i64,
 
     #[serde(rename = "t")]
-    timestamp: String,
+    timestamp: chrono::DateTime<chrono::Utc>,
 
     #[serde(rename = "x")]
     exchange: Option<String>,
 
     #[serde(rename = "z")]
     tape: Option<String>,
+}
+
+async fn process_batch(batch: &[OwnedMessage], pool: &sqlx::PgPool) {
+    let mut trades = Vec::new();
+
+    for message in batch {
+        let Some(payload) = message.payload_view::<str>() else {
+            continue;
+        };
+
+        let payload = match payload {
+            Ok(payload) => payload,
+            Err(error) => {
+                eprintln!("{} Invalid UTF-8 payload: {error}", timestamp());
+                continue;
+            }
+        };
+
+        let trade: Trade = match serde_json::from_str(payload) {
+            Ok(trade) => trade,
+            Err(error) => {
+                eprintln!("{} Invalid trade: {error}", timestamp());
+                eprintln!("{} Payload: {payload}", timestamp());
+                continue;
+            }
+        };
+
+        trades.push(trade);
+    }
+
+    if !trades.is_empty() {
+        let mut query_builder: QueryBuilder<Postgres> = QueryBuilder::new(
+            r#"
+        INSERT INTO trades
+            (trade_id, symbol, price, size, trade_timestamp, exchange, tape)
+        "#,
+        );
+
+        query_builder.push_values(&trades, |mut row, trade| {
+            row.push_bind(trade.trade_id)
+                .push_bind(&trade.symbol)
+                .push_bind(trade.price)
+                .push_bind(trade.size)
+                .push_bind(&trade.timestamp)
+                .push_bind(&trade.exchange)
+                .push_bind(&trade.tape);
+        });
+
+        query_builder.push(
+            r#"
+        ON CONFLICT (symbol, trade_id)
+        WHERE trade_id IS NOT NULL
+        DO NOTHING
+        "#,
+        );
+
+        let start = Instant::now();
+
+        let result = query_builder.build().execute(pool).await;
+
+        match result {
+            Ok(result) => {
+                println!(
+                    "{} POSTGRES BATCH trades={} rows_affected={} elapsed={:.2?}",
+                    timestamp(),
+                    trades.len(),
+                    result.rows_affected(),
+                    start.elapsed()
+                );
+            }
+
+            Err(error) => {
+                eprintln!("{} Postgres batch insert failed: {}", timestamp(), error);
+            }
+        }
+    }
+    println!(
+        "{} PROCESS batch_size={} trades={}",
+        timestamp(),
+        batch.len(),
+        trades.len()
+    );
 }
 
 #[tokio::main]
@@ -129,6 +211,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 received,
                 flushed
             );
+            process_batch(&batch, &pool).await;
             batch.clear();
         }
 
@@ -195,7 +278,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             ("trade_id", trade.trade_id.to_string()),
                             ("price", trade.price.to_string()),
                             ("size", trade.size.to_string()),
-                            ("timestamp", trade.timestamp.clone()),
+                            ("timestamp", trade.timestamp.to_string()),
                             ("exchange", trade.exchange.clone().unwrap_or_default()),
                             ("tape", trade.tape.clone().unwrap_or_default()),
                         ],
