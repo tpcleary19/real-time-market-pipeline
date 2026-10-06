@@ -149,20 +149,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut batch: Vec<OwnedMessage> = Vec::new();
     let mut stream = consumer.stream();
-    let mut trade_count: u64 = 0;
-    let mut postgres_total_us: u128 = 0;
-    let mut redis_total_us: u128 = 0;
-    let mut batch_start = Instant::now();
     let mut received: u64 = 0;
     let mut flushed: u64 = 0;
-    while let Some(message) = stream.next().await {
-        let message = match message {
-            Ok(message) => message,
-            Err(error) => {
-                eprintln!("{} Kafka error: {error}", timestamp());
-                continue;
-            }
-        };
 
         loop {
             if batch.is_empty() {
@@ -215,128 +203,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             batch.clear();
         }
 
-        let Some(payload) = message.payload_view::<str>() else {
-            continue;
-        };
-
-        let payload = payload?;
-
-        let trade: Trade = match serde_json::from_str(payload) {
-            Ok(trade) => trade,
-            Err(error) => {
-                eprintln!("{} Invalid trade: {error}", timestamp());
-                eprintln!("{} Payload: {payload}", timestamp());
-                continue;
-            }
-        };
-
-        /*        println!(
-            "{} Kafka -> {} price={} size={}",
-            timestamp(),
-            trade.symbol,
-            trade.price,
-            trade.size
-        );*/
-        let postgres_start = Instant::now();
-        let result = sqlx::query(
-            r#"
-            INSERT INTO trades
-                (trade_id, symbol, price, size, trade_timestamp, exchange, tape)
-            VALUES
-                ($1, $2, $3, $4, $5::timestamptz, $6, $7)
-            ON CONFLICT (symbol, trade_id)
-            WHERE trade_id IS NOT NULL
-            DO NOTHING
-            "#,
-        )
-        .bind(&trade.trade_id)
-        .bind(&trade.symbol)
-        .bind(trade.price)
-        .bind(trade.size)
-        .bind(&trade.timestamp)
-        .bind(&trade.exchange)
-        .bind(&trade.tape)
-        .execute(&pool)
-        .await;
-
-        let postgres_elapsed = postgres_start.elapsed();
-        if postgres_elapsed.as_millis() > 20 {
-            println!("{} SLOW Postgres: {:?}", timestamp(), postgres_elapsed);
-        }
-        postgres_total_us += postgres_elapsed.as_micros();
-        match result {
-            Ok(_) => {
-                //                println!("{} Postgres <- {}", timestamp(), trade.symbol);
-
-                // Update Redis only after Postgres succeeded.
-                let redis_key = format!("latest:{}", trade.symbol);
-                let redis_start = Instant::now();
-                let redis_result: redis::RedisResult<()> = redis_connection
-                    .hset_multiple(
-                        &redis_key,
-                        &[
-                            ("trade_id", trade.trade_id.to_string()),
-                            ("price", trade.price.to_string()),
-                            ("size", trade.size.to_string()),
-                            ("timestamp", trade.timestamp.to_string()),
-                            ("exchange", trade.exchange.clone().unwrap_or_default()),
-                            ("tape", trade.tape.clone().unwrap_or_default()),
-                        ],
-                    )
-                    .await;
-                let redis_elapsed = redis_start.elapsed();
-
-                if redis_elapsed.as_millis() > 20 {
-                    println!("{} SLOW Redis: {:?}", timestamp(), redis_elapsed);
-                }
-
-                redis_total_us += redis_elapsed.as_micros();
-                trade_count += 1;
-
-                match redis_result {
-                    Ok(_) => {
-                        println!("{} Redis <- {}", timestamp(), trade.symbol);
-
-                        // Only commit after BOTH Postgres and Redis succeeded.
-                        if let Err(error) = consumer.commit_message(&message, CommitMode::Async) {
-                            eprintln!("{} Kafka commit failed: {error}", timestamp());
-                        }
-                    }
-
-                    Err(error) => {
-                        eprintln!(
-                            "{} Redis update failed for {}: {}",
-                            timestamp(),
-                            trade.symbol,
-                            error
-                        );
-                    }
-                }
-            }
-
-            Err(error) => {
-                eprintln!(
-                    "{} Postgres insert failed for {}: {}",
-                    timestamp(),
-                    trade.symbol,
-                    error
-                );
-            }
-        }
-        if trade_count % 1000 == 0 {
-            let batch_elapsed = batch_start.elapsed().as_secs_f64();
-            let throughput = 1000.0 / batch_elapsed;
-            println!(
-                "{} STATS trades={} throughput={:.0}/sec postgres_avg={:.2}ms redis_avg={:.2}ms",
-                timestamp(),
-                trade_count,
-                throughput,
-                postgres_total_us as f64 / trade_count as f64 / 1000.0,
-                redis_total_us as f64 / trade_count as f64 / 1000.0,
-            );
-            batch_start = Instant::now();
-        }
-    }
 
     Ok(())
 }
