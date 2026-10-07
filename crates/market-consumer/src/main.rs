@@ -1,13 +1,14 @@
 use chrono::Local;
 use futures_util::StreamExt;
 use rdkafka::{
+    Offset, TopicPartitionList,
     config::ClientConfig,
     consumer::{CommitMode, Consumer, StreamConsumer},
     message::{Message, OwnedMessage},
 };
-use redis::AsyncCommands;
 use serde::Deserialize;
 use sqlx::{Postgres, QueryBuilder, postgres::PgPoolOptions};
+use std::collections::HashMap;
 use tokio::time::{Duration, Instant};
 
 fn timestamp() -> String {
@@ -38,8 +39,14 @@ struct Trade {
     tape: Option<String>,
 }
 
-async fn process_batch(batch: &[OwnedMessage], pool: &sqlx::PgPool) {
+async fn process_batch(
+    batch: &[OwnedMessage],
+    pool: &sqlx::PgPool,
+    redis_connection: &mut redis::aio::MultiplexedConnection,
+    consumer: &StreamConsumer,
+) {
     let mut trades = Vec::new();
+    let mut highest_offsets: HashMap<i32, i64> = HashMap::new();
 
     for message in batch {
         let Some(payload) = message.payload_view::<str>() else {
@@ -64,6 +71,10 @@ async fn process_batch(batch: &[OwnedMessage], pool: &sqlx::PgPool) {
         };
 
         trades.push(trade);
+        highest_offsets
+            .entry(message.partition())
+            .and_modify(|offset| *offset = (*offset).max(message.offset()))
+            .or_insert(message.offset());
     }
 
     if !trades.is_empty() {
@@ -105,6 +116,96 @@ async fn process_batch(batch: &[OwnedMessage], pool: &sqlx::PgPool) {
                     result.rows_affected(),
                     start.elapsed()
                 );
+
+                let mut latest_by_symbol: HashMap<&str, &Trade> = HashMap::new();
+
+                for trade in &trades {
+                    latest_by_symbol.insert(&trade.symbol, trade);
+                }
+
+                println!(
+                    "{} REDIS COLLAPSE trades={} symbols={}",
+                    timestamp(),
+                    trades.len(),
+                    latest_by_symbol.len()
+                );
+
+                let mut redis_pipe = redis::pipe();
+
+                for trade in latest_by_symbol.values() {
+                    let redis_key = format!("latest:{}", trade.symbol);
+
+                    redis_pipe
+                        .cmd("HSET")
+                        .arg(&redis_key)
+                        .arg("trade_id")
+                        .arg(trade.trade_id.to_string())
+                        .arg("price")
+                        .arg(trade.price.to_string())
+                        .arg("size")
+                        .arg(trade.size.to_string())
+                        .arg("timestamp")
+                        .arg(trade.timestamp.to_string())
+                        .arg("exchange")
+                        .arg(trade.exchange.clone().unwrap_or_default())
+                        .arg("tape")
+                        .arg(trade.tape.clone().unwrap_or_default())
+                        .ignore();
+                }
+
+                let redis_start = Instant::now();
+
+                let redis_result: redis::RedisResult<()> =
+                    redis_pipe.query_async(redis_connection).await;
+
+                let redis_elapsed = redis_start.elapsed();
+
+                match redis_result {
+                    Ok(_) => {
+                        println!(
+                            "{} REDIS BATCH symbols={} elapsed={:.2?}",
+                            timestamp(),
+                            latest_by_symbol.len(),
+                            redis_elapsed
+                        );
+
+                        let mut offsets = TopicPartitionList::new();
+
+                        for (&partition, &offset) in &highest_offsets {
+                            if let Err(error) = offsets.add_partition_offset(
+                                "stock-trades",
+                                partition,
+                                Offset::Offset(offset + 1),
+                            ) {
+                                eprintln!(
+                                    "{} Failed to build Kafka commit for partition {}: {}",
+                                    timestamp(),
+                                    partition,
+                                    error
+                                );
+                                return;
+                            }
+                        }
+
+                        match consumer.commit(&offsets, CommitMode::Async) {
+                            Ok(_) => {
+                                println!(
+                                    "{} KAFKA COMMIT partitions={} messages={}",
+                                    timestamp(),
+                                    highest_offsets.len(),
+                                    trades.len()
+                                );
+                            }
+
+                            Err(error) => {
+                                eprintln!("{} Kafka commit failed: {}", timestamp(), error);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("{} Redis pipeline failed: {}", timestamp(), error);
+                    }
+                }
             }
 
             Err(error) => {
@@ -152,57 +253,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut received: u64 = 0;
     let mut flushed: u64 = 0;
 
-        loop {
-            if batch.is_empty() {
-                match stream.next().await {
-                    Some(Ok(message)) => {
-                        batch.push(message.detach());
-                        received += 1;
-                    }
-                    Some(Err(error)) => {
-                        eprintln!("{} Kafka error: {error}", timestamp());
-                        continue;
-                    }
-                    None => break,
+    loop {
+        if batch.is_empty() {
+            match stream.next().await {
+                Some(Ok(message)) => {
+                    batch.push(message.detach());
+                    received += 1;
                 }
-            }
-
-            let deadline = Instant::now() + Duration::from_millis(100);
-
-            while batch.len() < 100 {
-                tokio::select! {
-                    message = stream.next() => {
-                        match message {
-                            Some(Ok(message)) => {
-                                batch.push(message.detach());
-                                received += 1;
-                            }
-
-                            Some(Err(error)) => {
-                                eprintln!("{} Kafka error: {error}", timestamp());
-                            }
-
-                            None => break,
-                        }
-                    }
-
-                    _ = tokio::time::sleep_until(deadline) => {
-                        break;
-                    }
+                Some(Err(error)) => {
+                    eprintln!("{} Kafka error: {error}", timestamp());
+                    continue;
                 }
+                None => break,
             }
-            flushed += batch.len() as u64;
-            println!(
-                "{} BATCH size={} received={} flushed={}",
-                timestamp(),
-                batch.len(),
-                received,
-                flushed
-            );
-            process_batch(&batch, &pool).await;
-            batch.clear();
         }
 
+        let deadline = Instant::now() + Duration::from_millis(100);
+
+        while batch.len() < 100 {
+            tokio::select! {
+                message = stream.next() => {
+                    match message {
+                        Some(Ok(message)) => {
+                            batch.push(message.detach());
+                            received += 1;
+                        }
+
+                        Some(Err(error)) => {
+                            eprintln!("{} Kafka error: {error}", timestamp());
+                        }
+
+                        None => break,
+                    }
+                }
+
+                _ = tokio::time::sleep_until(deadline) => {
+                    break;
+                }
+            }
+        }
+        flushed += batch.len() as u64;
+        println!(
+            "{} BATCH size={} received={} flushed={}",
+            timestamp(),
+            batch.len(),
+            received,
+            flushed
+        );
+        process_batch(&batch, &pool, &mut redis_connection, &consumer).await;
+        batch.clear();
+    }
 
     Ok(())
 }
