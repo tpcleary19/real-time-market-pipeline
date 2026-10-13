@@ -81,7 +81,7 @@ async fn process_batch(
         let mut query_builder: QueryBuilder<Postgres> = QueryBuilder::new(
             r#"
         INSERT INTO trades
-            (trade_id, symbol, price, size, trade_timestamp, exchange, tape)
+        (trade_id, symbol, price, size, trade_timestamp, exchange, tape, trade_date)
         "#,
         );
 
@@ -92,12 +92,18 @@ async fn process_batch(
                 .push_bind(trade.size)
                 .push_bind(&trade.timestamp)
                 .push_bind(&trade.exchange)
-                .push_bind(&trade.tape);
+                .push_bind(&trade.tape)
+                .push_bind(
+                    trade
+                        .timestamp
+                        .with_timezone(&chrono_tz::America::New_York)
+                        .date_naive(),
+                );
         });
 
         query_builder.push(
             r#"
-        ON CONFLICT (symbol, trade_id)
+        ON CONFLICT (symbol, trade_id, trade_date)
         WHERE trade_id IS NOT NULL
         DO NOTHING
         "#,
