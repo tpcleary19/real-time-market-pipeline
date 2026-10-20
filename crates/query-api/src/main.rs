@@ -1,3 +1,5 @@
+mod alerts;
+
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
@@ -58,6 +60,8 @@ async fn main() {
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/alerts", get(alerts::all))
+        .route("/alerts/{symbol}", get(alerts::symbol))
         .route("/prices/{symbol}", get(get_price))
         .route("/trades/{symbol}", get(get_trades))
         .with_state(app_state);

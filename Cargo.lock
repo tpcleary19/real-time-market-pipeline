@@ -1284,10 +1284,13 @@ name = "query-api"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "chrono",
  "redis",
  "serde",
+ "serde_json",
  "sqlx",
  "tokio",
+ "tower",
 ]
 
 [[package]]

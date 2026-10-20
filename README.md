@@ -407,3 +407,33 @@ The PostgreSQL round-trip integration test uses a temporary table inside a rolle
 ```bash
 TEST_DATABASE_URL=postgres://market:market@localhost:5432/market_data cargo test -p pattern-detector postgres_round_trip -- --ignored
 ```
+
+### Alert history API
+
+The query API now exposes:
+- `GET /alerts`: latest alerts across symbols.
+- `GET /alerts/{symbol}`: latest alerts for one symbol (normalized to uppercase).
+
+Both routes accept combinable query parameters:
+- `limit`: defaults to 20, clamped to 1-100.
+- `direction`: exactly `Up` or `Down`.
+- `from`, `to`: RFC 3339 timestamps with timezone; from is inclusive and to is exclusive. When both are provided, from must precede to.
+- `min_movement_pct`: finite nonnegative absolute percentage threshold, inclusive.
+
+Results are JSON arrays ordered by event timestamp descending, then alert ID descending for ties. No matches returns an empty array. Invalid query values return HTTP 400; database failures return HTTP 500 without internal error details. Response fields are id, symbol, direction, movement_percent, baseline_price, price, window_start, event_timestamp. Prices/percentages are JSON numbers; timestamps are UTC RFC 3339 strings. Kafka metadata stays in storage for troubleshooting.
+
+Examples:
+
+```bash
+curl "http://localhost:3000/alerts?limit=20"
+curl "http://localhost:3000/alerts/AAPL?direction=Down&min_movement_pct=3"
+curl "http://localhost:3000/alerts?from=2026-10-20T00:00:00Z&to=2026-10-21T00:00:00Z"
+```
+
+After applying the alerts migration, run the route integration test against local PostgreSQL:
+
+```bash
+TEST_DATABASE_URL=postgres://market:market@localhost:5432/market_data cargo test -p query-api alert_routes_postgres -- --ignored
+```
+
+This test uses a single-connection pool and a session-local temporary table shadowing the public alerts table, leaving live alert history untouched.
