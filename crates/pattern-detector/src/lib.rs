@@ -1,3 +1,5 @@
+pub mod persistence;
+
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use market_events::Trade;
 use std::collections::{HashMap, HashSet, VecDeque};

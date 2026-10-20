@@ -366,14 +366,44 @@ Postgres latency increased from ~1.97 ms to ~2.4 ms
 under three-consumer load, while Redis remained ~0.55 ms.
 ## Pattern detector
 
-Run `cargo run -p pattern-detector` alongside the existing services. It requires only Kafka at localhost:9092. Its independent group `pattern-detector` subscribes to `stock-trades`, receiving its own copy of events without taking messages from the storage consumer. The producer, shared Trade schema, storage consumer, and API are unchanged.
+Run `cargo run -p pattern-detector` alongside the existing services. It requires Kafka at localhost:9092 and PostgreSQL. Its independent group `pattern-detector` subscribes to `stock-trades`, receiving its own copy of events without taking messages from the storage consumer. The producer, shared Trade schema, storage consumer, and API are unchanged.
 
 Each symbol has an event-time rolling five-minute window, including the exact five-minute boundary. The newest accepted price is compared with the oldest retained price: (latest - baseline) / baseline. Movement of at least +2% or at most -2% emits a stdout alert immediately; a full five minutes of history is not required. A gap over five minutes establishes a new baseline.
 
 Trades older than the latest accepted timestamp for that symbol are ignored. Equal timestamps retain Kafka arrival order. Invalid prices (nonpositive/nonfinite) and blank symbols are ignored. Duplicate (symbol, New York trade date, trade ID) events are suppressed within the retained window, following the historical store's trading-date convention. Deduplication keys expire with their trades. Continuous above-threshold movement emits once per direction; returning inside the threshold rearms alerts, and a direction change can alert immediately.
 
-Offsets become eligible for periodic Kafka commits only after processing and flushing any alert. Malformed JSON and empty payloads are logged and skipped. Kafka receive/store failures and stdout failures terminate the process. New groups start at latest; existing committed offsets resume normally. Alerts are observational stdout output, without durable or exactly-once delivery guarantees.
+Offsets become eligible for periodic Kafka commits only after processing and flushing any alert. Malformed JSON and empty payloads are logged and skipped. Kafka receive/store failures and stdout failures terminate the process. New groups start at latest; existing committed offsets resume normally. Alerts are persisted to PostgreSQL before stdout output and offset storage; see alert persistence below.
 
 State is in memory. Restarts and partition reassignment lose continuity or can repeat alerts; run one detector instance for this initial version. Keep producer messages keyed by symbol. Memory scales with the number of trades in five minutes per active symbol. Inactive symbols retain their last window until the next trade; symbol entries are not evicted. Production use would require checkpointed partition state and a durable idempotent alert sink.
 
 Run `cargo test -p pattern-detector` for tests of thresholds, boundaries, expiry, symbol isolation, trade and alert deduplication, rearming, idle gaps, late events, invalid inputs, date rollover, and shared wire deserialization. No Kafka or databases are required for unit tests.
+
+
+### Alert persistence
+
+Apply the additive migration before restarting the detector:
+
+```bash
+docker exec -i market-postgres psql -v ON_ERROR_STOP=1 -U market -d market_data < db/migrations/003_create_pattern_alerts.sql
+cargo run -p pattern-detector
+```
+
+The detector reads DATABASE_URL from the process environment (it does not load .env), defaulting to the existing local market database. It checks the alerts table before subscribing. Each alert stores symbol, direction, percentage move, baseline/current prices, event-time window start/end, receive time, and triggering Kafka topic/partition/offset. Database failures retry the same alert every two seconds before offset storage; polling can exceed Kafka's session processing limit during a long outage, so this is intended for one detector instance.
+
+The unique Kafka source position prevents duplicate rows when an insert is retried, including when the database committed but the response was lost. This does not provide exactly-once detection: rolling windows and latches are still in memory, so a restart/rebalance can lose detection context and miss alerts. Stdout can repeat after retries/restarts; the database is the alert history. Previously printed alerts are not backfilled. Checkpointed detector state remains future work.
+
+Inspect recent history:
+
+```sql
+SELECT symbol, direction, movement_percent, baseline_price, price,
+       window_start, event_timestamp
+FROM pattern_alerts
+ORDER BY event_timestamp DESC
+LIMIT 20;
+```
+
+The PostgreSQL round-trip integration test uses a temporary table inside a rolled-back transaction. Run it after applying the migration:
+
+```bash
+TEST_DATABASE_URL=postgres://market:market@localhost:5432/market_data cargo test -p pattern-detector postgres_round_trip -- --ignored
+```
