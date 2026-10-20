@@ -364,3 +364,16 @@ Scaling improvement:
 Observed bottleneck shift:
 Postgres latency increased from ~1.97 ms to ~2.4 ms
 under three-consumer load, while Redis remained ~0.55 ms.
+## Pattern detector
+
+Run `cargo run -p pattern-detector` alongside the existing services. It requires only Kafka at localhost:9092. Its independent group `pattern-detector` subscribes to `stock-trades`, receiving its own copy of events without taking messages from the storage consumer. The producer, shared Trade schema, storage consumer, and API are unchanged.
+
+Each symbol has an event-time rolling five-minute window, including the exact five-minute boundary. The newest accepted price is compared with the oldest retained price: (latest - baseline) / baseline. Movement of at least +2% or at most -2% emits a stdout alert immediately; a full five minutes of history is not required. A gap over five minutes establishes a new baseline.
+
+Trades older than the latest accepted timestamp for that symbol are ignored. Equal timestamps retain Kafka arrival order. Invalid prices (nonpositive/nonfinite) and blank symbols are ignored. Duplicate (symbol, New York trade date, trade ID) events are suppressed within the retained window, following the historical store's trading-date convention. Deduplication keys expire with their trades. Continuous above-threshold movement emits once per direction; returning inside the threshold rearms alerts, and a direction change can alert immediately.
+
+Offsets become eligible for periodic Kafka commits only after processing and flushing any alert. Malformed JSON and empty payloads are logged and skipped. Kafka receive/store failures and stdout failures terminate the process. New groups start at latest; existing committed offsets resume normally. Alerts are observational stdout output, without durable or exactly-once delivery guarantees.
+
+State is in memory. Restarts and partition reassignment lose continuity or can repeat alerts; run one detector instance for this initial version. Keep producer messages keyed by symbol. Memory scales with the number of trades in five minutes per active symbol. Inactive symbols retain their last window until the next trade; symbol entries are not evicted. Production use would require checkpointed partition state and a durable idempotent alert sink.
+
+Run `cargo test -p pattern-detector` for tests of thresholds, boundaries, expiry, symbol isolation, trade and alert deduplication, rearming, idle gaps, late events, invalid inputs, date rollover, and shared wire deserialization. No Kafka or databases are required for unit tests.

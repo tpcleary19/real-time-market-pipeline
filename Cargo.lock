@@ -1200,6 +1200,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pattern-detector"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "chrono-tz",
+ "market-events",
+ "rdkafka 0.39.0",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

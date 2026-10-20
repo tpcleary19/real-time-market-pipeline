@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/market-events",
+    "crates/pattern-detector",
     "crates/market-producer",
     "crates/market-consumer",
     "crates/query-api",
