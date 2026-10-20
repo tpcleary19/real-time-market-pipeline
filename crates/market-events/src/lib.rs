@@ -1,14 +1,23 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct Trade {
+    #[serde(rename = "i")]
+    pub trade_id: i64,
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    #[serde(rename = "S")]
+    pub symbol: String,
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
+    #[serde(rename = "p")]
+    pub price: f64,
+
+    #[serde(rename = "s")]
+    pub size: i64,
+
+    #[serde(rename = "t")]
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+
+    #[serde(rename = "x")]
+    pub exchange: Option<String>,
+
+    #[serde(rename = "z")]
+    pub tape: Option<String>,
 }

@@ -984,6 +984,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "futures-util",
+ "market-events",
  "rdkafka 0.39.0",
  "redis",
  "serde",
@@ -995,6 +996,10 @@ dependencies = [
 [[package]]
 name = "market-events"
 version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+]
 
 [[package]]
 name = "market-producer"

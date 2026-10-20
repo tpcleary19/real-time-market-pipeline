@@ -1,42 +1,18 @@
 use chrono::Local;
 use futures_util::StreamExt;
+use market_events::Trade;
 use rdkafka::{
     Offset, TopicPartitionList,
     config::ClientConfig,
     consumer::{CommitMode, Consumer, StreamConsumer},
     message::{Message, OwnedMessage},
 };
-use serde::Deserialize;
 use sqlx::{Postgres, QueryBuilder, postgres::PgPoolOptions};
 use std::collections::HashMap;
 use tokio::time::{Duration, Instant};
 
 fn timestamp() -> String {
     Local::now().format("%m-%d %H:%M:%S").to_string()
-}
-
-#[derive(Debug, Deserialize)]
-struct Trade {
-    #[serde(rename = "i")]
-    trade_id: i64,
-
-    #[serde(rename = "S")]
-    symbol: String,
-
-    #[serde(rename = "p")]
-    price: f64,
-
-    #[serde(rename = "s")]
-    size: i64,
-
-    #[serde(rename = "t")]
-    timestamp: chrono::DateTime<chrono::Utc>,
-
-    #[serde(rename = "x")]
-    exchange: Option<String>,
-
-    #[serde(rename = "z")]
-    tape: Option<String>,
 }
 
 async fn process_batch(
