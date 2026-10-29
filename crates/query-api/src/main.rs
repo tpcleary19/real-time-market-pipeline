@@ -66,9 +66,9 @@ async fn main() {
         .route("/trades/{symbol}", get(get_trades))
         .with_state(app_state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3001").await.unwrap();
 
-    println!("Query API listening on http://localhost:3000");
+    println!("Query API listening on http://localhost:3001");
 
     axum::serve(listener, app).await.unwrap();
 }
