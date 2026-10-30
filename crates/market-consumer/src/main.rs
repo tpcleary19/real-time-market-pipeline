@@ -205,11 +205,17 @@ async fn process_batch(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let database_url = "postgres://market:market@localhost:5432/market_data";
+    match dotenvy::dotenv() {
+        Ok(_) => {}
+        Err(dotenvy::Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://market:market@localhost:5432/market_data".into());
 
     let pool = PgPoolOptions::new()
         .max_connections(5)
-        .connect(database_url)
+        .connect(&database_url)
         .await?;
 
     println!("{} Connected to Postgres.", timestamp());

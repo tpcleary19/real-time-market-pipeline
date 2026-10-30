@@ -20,3 +20,7 @@ provision*
 .env.*
 !.env.example
 *.local
+
+# Locally installed Neon agent skills
+/.agents/skills/neon*/
+/skills-lock.json

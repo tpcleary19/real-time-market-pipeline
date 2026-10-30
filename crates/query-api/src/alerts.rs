@@ -203,7 +203,6 @@ mod tests {
             .route("/alerts", get(all))
             .route("/alerts/{symbol}", get(symbol))
             .with_state(AppState {
-                redis: redis::Client::open("redis://127.0.0.1/")?,
                 postgres: pool.clone(),
             });
         for (uri, expected) in [

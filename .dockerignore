@@ -1,0 +1,9 @@
+**
+!Cargo.toml
+!Cargo.lock
+!crates/
+!crates/**
+crates/**/target
+crates/**/.env
+crates/**/.env.*
+crates/**/.git

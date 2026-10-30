@@ -86,16 +86,16 @@ PostgreSQL also has a unique index on `(symbol, trade_id)`, and inserts use `ON 
 
 ### `query-api`
 
-Axum HTTP service listening on port `3000`.
+Axum HTTP service listening on port `3001`.
 
-Shared Redis and PostgreSQL handles are created at startup and provided to request handlers through Axum application state.
+A shared PostgreSQL pool are created at startup and provided to request handlers through Axum application state.
 
 Current endpoints:
 
 | Endpoint | Store | Purpose |
 | --- | --- | --- |
 | `GET /health` | — | Basic process health response |
-| `GET /prices/{symbol}` | Redis | Latest known trade for a symbol |
+| `GET /prices/{symbol}` | PostgreSQL | Latest known trade for a symbol |
 | `GET /trades/{symbol}?limit=N` | PostgreSQL | Most recent historical trades |
 
 The historical endpoint defaults to 10 trades. The requested limit is clamped to the range **1–100**.
@@ -103,11 +103,11 @@ The historical endpoint defaults to 10 trades. The requested limit is clamped to
 Examples:
 
 ```bash
-curl http://localhost:3000/health
+curl http://localhost:3001/health
 
-curl http://localhost:3000/prices/AAPL
+curl http://localhost:3001/prices/AAPL
 
-curl "http://localhost:3000/trades/AAPL?limit=20"
+curl "http://localhost:3001/trades/AAPL?limit=20"
 ```
 
 ## Technology
@@ -235,8 +235,8 @@ cargo run -p query-api
 Then query the pipeline:
 
 ```bash
-curl http://localhost:3000/prices/AAPL
-curl "http://localhost:3000/trades/AAPL?limit=10"
+curl http://localhost:3001/prices/AAPL
+curl "http://localhost:3001/trades/AAPL?limit=10"
 ```
 
 ## Data Model
@@ -425,9 +425,9 @@ Results are JSON arrays ordered by event timestamp descending, then alert ID des
 Examples:
 
 ```bash
-curl "http://localhost:3000/alerts?limit=20"
-curl "http://localhost:3000/alerts/AAPL?direction=Down&min_movement_pct=3"
-curl "http://localhost:3000/alerts?from=2026-10-20T00:00:00Z&to=2026-10-21T00:00:00Z"
+curl "http://localhost:3001/alerts?limit=20"
+curl "http://localhost:3001/alerts/AAPL?direction=Down&min_movement_pct=3"
+curl "http://localhost:3001/alerts?from=2026-10-20T00:00:00Z&to=2026-10-21T00:00:00Z"
 ```
 
 After applying the alerts migration, run the route integration test against local PostgreSQL:
@@ -437,3 +437,40 @@ TEST_DATABASE_URL=postgres://market:market@localhost:5432/market_data cargo test
 ```
 
 This test uses a single-connection pool and a session-local temporary table shadowing the public alerts table, leaving live alert history untouched.
+
+
+### Database connection (local or Neon)
+
+Run `cargo run -p market-consumer` and `cargo run -p query-api` from the
+workspace root. Both load the Git-ignored `.env` file and read `DATABASE_URL`;
+an existing process environment variable takes precedence. If unset, they use
+the existing local PostgreSQL database. SQLx supports TLS with native trust roots;
+keep the SSL parameters supplied by Neon. Never commit the connection string.
+Redis and Kafka remain local for this stage. The API reads latest prices from PostgreSQL and does not require Redis.
+
+Apply the SQL files in `db/migrations` in numeric order using a direct (unpooled)
+database connection, before starting the consumer.
+
+### API configuration
+
+The API reads all price, trade, and alert data from PostgreSQL (Neon when configured).
+The consumer still maintains local Redis, but the API has no Redis dependency.
+Latest prices are selected by market timestamp descending, then row ID for ties.
+Missing symbols return 404; numeric price/size/ID fields retain their string format.
+
+- `PORT`: defaults to `3001`; binds to `0.0.0.0` for container hosting.
+- `CORS_ALLOWED_ORIGINS`: comma-separated dashboard origins; defaults to
+  `http://localhost:5173,http://127.0.0.1:5173`. Set the exact Vercel origin when deployed.
+- `GET /health`: process liveness.
+- `GET /ready`: checks PostgreSQL connectivity; returns 503 on failure.
+
+Run from the project root: `cargo run -p query-api`. Test with:
+
+```bash
+curl http://localhost:3001/ready
+curl http://localhost:3001/prices/AAPL
+curl 'http://localhost:3001/trades/AAPL?limit=5'
+curl 'http://localhost:3001/alerts?limit=5'
+```
+
+CORS controls browser access, not authentication. These routes expose read-only market data.
