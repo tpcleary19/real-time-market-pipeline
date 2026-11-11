@@ -66,7 +66,7 @@ async fn process_batch(
                 .push_bind(&trade.symbol)
                 .push_bind(trade.price)
                 .push_bind(trade.size)
-                .push_bind(&trade.timestamp)
+                .push_bind(trade.timestamp)
                 .push_bind(&trade.exchange)
                 .push_bind(&trade.tape)
                 .push_bind(

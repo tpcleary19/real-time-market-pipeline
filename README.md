@@ -2,49 +2,28 @@
 
 > **Status:** Active development
 
-A Rust-based real-time market data pipeline that ingests live equity trades from Alpaca, publishes them through Kafka, persists historical data in PostgreSQL, maintains the latest trade state in Redis, and exposes both views through an Axum HTTP API.
+A Rust-based real-time market data pipeline that ingests live equity trades from Alpaca, publishes them through Kafka, persists historical data in PostgreSQL, maintains the latest trade state in Redis, and exposes latest prices, trade history, and pattern alerts through an Axum HTTP API backed by PostgreSQL.
 
 The project is intentionally built as a small distributed system rather than a single application. It is being used to explore event-driven architecture, durable vs. low-latency storage, consumer reliability, backpressure, and operational behavior under load.
 
 ## Architecture
 
-```text
-Alpaca IEX WebSocket
-        |
-        v
-  market-producer
-      (Rust)
-        |
-        v
-      Kafka
-  stock-trades topic
-        |
-        v
-  market-consumer
-      (Rust)
-      /     \
-     v       v
-PostgreSQL  Redis
- historical  latest
-  trades     state
-     \       /
-      \     /
-       v   v
-      query-api
-       (Axum)
-      /       \
-     v         v
-/prices     /trades
+```mermaid
+flowchart TD
+    A[Alpaca WebSocket] --> B[market-producer]
+    B --> C[Kafka: stock-trades]
+    C --> D[market-consumer]
+    D --> E[(PostgreSQL / Neon)]
+    D --> F[(Redis latest-state cache)]
+    C --> G[pattern-detector]
+    G --> E
+    E --> H[query-api / Cloud Run]
+    H --> I[React dashboard]
 ```
 
-### Why PostgreSQL and Redis?
+PostgreSQL stores durable trades and pattern alerts and serves all current API queries. The consumer also maintains Redis latest-state hashes; the query API has no Redis dependency.
 
-The two stores serve different read patterns:
-
-- **PostgreSQL** stores durable historical trade data and supports ordered historical queries.
-- **Redis** stores the latest trade for each symbol for low-latency current-state lookups.
-
-This lets the API use the store that best matches each request instead of treating both databases as interchangeable copies.
+The query API is deployed on Google Cloud Run with Neon PostgreSQL. Kafka, ingestion, and the pattern detector run independently of the API container. See [deployment instructions](deploy/README.md) and the [dashboard repository](https://github.com/tpcleary19/market-pipeline-dashboard).
 
 ## Components
 
@@ -68,33 +47,36 @@ Consumes trade events from Kafka and writes them to both storage systems.
 Processing order is deliberately:
 
 ```text
-Kafka message
+Kafka batch (up to 100 messages or 100 ms)
     |
     v
-PostgreSQL insert
+PostgreSQL batch insert
     |
     v
-Redis update
+Redis pipeline update
     |
     v
 Kafka offset commit
 ```
 
-Kafka auto-commit is disabled. The consumer commits a message offset only after both PostgreSQL and Redis have succeeded.
+Kafka auto-commit is disabled. After both storage writes succeed, the consumer queues an asynchronous commit of the next offset for each partition in the batch. Queueing the commit does not confirm broker acknowledgement. See the reliability limitations below.
 
-PostgreSQL also has a unique index on `(symbol, trade_id)`, and inserts use `ON CONFLICT ... DO NOTHING`. This makes replayed trade events safe for the historical store if a message is processed again before its Kafka offset is successfully committed.
+PostgreSQL has a partial unique index on `(symbol, trade_id, trade_date)` for non-null trade IDs. Inserts use `ON CONFLICT ... DO NOTHING` to deduplicate replayed trades within a New York trading date.
 
 ### `query-api`
 
 Axum HTTP service listening on port `3001`.
 
-A shared PostgreSQL pool are created at startup and provided to request handlers through Axum application state.
+A shared PostgreSQL pool is created at startup and provided to request handlers through Axum application state.
 
 Current endpoints:
 
 | Endpoint | Store | Purpose |
 | --- | --- | --- |
 | `GET /health` | — | Basic process health response |
+| `GET /ready` | PostgreSQL | Database readiness; 503 on failure |
+| `GET /alerts` | PostgreSQL | Recent pattern alerts |
+| `GET /alerts/{symbol}` | PostgreSQL | Recent alerts for one symbol |
 | `GET /prices/{symbol}` | PostgreSQL | Latest known trade for a symbol |
 | `GET /trades/{symbol}?limit=N` | PostgreSQL | Most recent historical trades |
 
@@ -130,6 +112,7 @@ The local Docker environment currently uses PostgreSQL 18, Redis 8, and Apache K
 .
 ├── crates/
 │   ├── market-events/
+│   ├── pattern-detector/
 │   ├── market-producer/
 │   ├── market-consumer/
 │   ├── query-api/
@@ -137,7 +120,9 @@ The local Docker environment currently uses PostgreSQL 18, Redis 8, and Apache K
 │   └── load-generator/
 ├── db/
 │   └── migrations/
-│       └── 001_create_trades.sql
+│       ├── 001_create_trades.sql
+│       ├── 002_add_trade_date.sql
+│       └── 003_create_pattern_alerts.sql
 ├── Cargo.toml
 └── docker-compose.yml
 ```
@@ -172,8 +157,14 @@ This starts:
 
 ```bash
 docker exec -i market-postgres \
-  psql -U market -d market_data \
+  psql -v ON_ERROR_STOP=1 -U market -d market_data \
   < db/migrations/001_create_trades.sql
+docker exec -i market-postgres \
+  psql -v ON_ERROR_STOP=1 -U market -d market_data \
+  < db/migrations/002_add_trade_date.sql
+docker exec -i market-postgres \
+  psql -v ON_ERROR_STOP=1 -U market -d market_data \
+  < db/migrations/003_create_pattern_alerts.sql
 ```
 
 ### 3. Create the Kafka topic
@@ -197,7 +188,13 @@ docker exec market-kafka /opt/kafka/bin/kafka-topics.sh \
 
 ### 4. Configure Alpaca
 
-Create a local `.env` file with your credentials and desired symbols:
+Copy `.env.example` to `.env`, then configure your credentials and desired symbols. The example uses the local PostgreSQL database; for Neon, use your connection string with its supplied TLS settings. Apply the migrations to the database selected by `DATABASE_URL` using a direct connection.
+
+```bash
+cp .env.example .env
+```
+
+Example feed settings:
 
 ```text
 APCA_API_KEY_ID=...
@@ -261,7 +258,7 @@ The primary historical access index is:
 A unique index on:
 
 ```text
-(symbol, trade_id)
+(symbol, trade_id, trade_date)
 ```
 
 provides deduplication for replayed events.
@@ -276,17 +273,11 @@ with fields for trade ID, price, size, timestamp, exchange, and tape.
 
 ## Reliability Model
 
-The current consumer provides an **at-least-once-oriented processing design** rather than claiming end-to-end exactly-once delivery.
+The consumer writes PostgreSQL before Redis and queues Kafka offset commits after both succeed. Historical inserts are idempotent for `(symbol, trade_id, trade_date)`.
 
-Important behaviors:
+**Recovery is incomplete:** a failed PostgreSQL or Redis batch is logged and cleared, and processing continues. A later successful batch can commit past failed records in the same partition. Asynchronous commit completion is not confirmed. Malformed records are logged and skipped. This implementation does not yet guarantee at-least-once delivery during storage failures.
 
-- Kafka automatic offset commits are disabled.
-- PostgreSQL is written before Redis.
-- The Kafka offset is committed only after both writes succeed.
-- PostgreSQL trade inserts are idempotent for the same `(symbol, trade_id)`.
-- If PostgreSQL succeeds but Redis or the Kafka commit fails, a replay can safely retry the event without duplicating the PostgreSQL trade.
-
-This is intentionally simple for the first version and provides a base for later failure and recovery testing.
+Redis keeps the last arrival for each symbol within a batch, which can differ from the newest market timestamp when events arrive out of order. The API instead orders PostgreSQL trades by market timestamp and row ID.
 
 ## Current Limitations
 
@@ -294,11 +285,11 @@ The current implementation favors clarity over maximum throughput or production 
 
 Known areas to improve include:
 
-- Consumer processing is currently sequential and persists one trade at a time.
+- Consumer batches are processed sequentially, with up to 100 messages per batch.
 - Configuration such as database, Redis, and Kafka addresses is still hard-coded in several services.
 - Kafka storage is not yet backed by a Docker named volume.
 - `/health` is currently a process-level response and does not verify downstream dependencies.
-- The API obtains a Redis connection from the client for each request.
+- Storage failures need retry or fail-stop handling before consumer offsets can be considered reliable.
 - There is not yet structured observability for consumer lag, throughput, or latency.
 - Local infrastructure is single-node and intended for development, not high availability.
 
@@ -306,16 +297,16 @@ Known areas to improve include:
 
 Near-term work is focused on distributed-systems behavior rather than adding more CRUD endpoints:
 
-- Build out the load generator.
+- Extend the existing synthetic load generator and record reproducible benchmark conditions.
 - Measure Kafka consumer lag and pipeline throughput.
 - Deliberately create backpressure and observe recovery behavior.
-- Batch PostgreSQL writes.
+- Add failure/recovery tests for batched writes and offset commits.
 - Explore parallel consumers across Kafka partitions.
 - Test failure scenarios involving PostgreSQL, Redis, Kafka, and process restarts.
 - Add Kafka persistence to the local Docker environment.
 - Move service configuration into environment-based configuration.
-- Improve health/readiness checks and observability.
-- Deploy the pipeline to AWS.
+- Extend existing health/readiness checks with operational metrics.
+- Extend the current Cloud Run API deployment with a deployment plan for ingestion services.
 
 A later extension may add a Python service for analytics, risk, signals, or AI-oriented workloads while keeping the latency-sensitive ingestion/data path in Rust.
 
@@ -335,6 +326,8 @@ The goal is not just to move stock prices between technologies. The project is i
 - eventual cloud deployment
 
 ## Performance Baseline
+
+Historical measurements from the earlier sequential consumer, before batching. These are development observations, not benchmarks for the current implementation.
 
 Initial single-partition load test:
 
@@ -456,7 +449,7 @@ database connection, before starting the consumer.
 The API reads all price, trade, and alert data from PostgreSQL (Neon when configured).
 The consumer still maintains local Redis, but the API has no Redis dependency.
 Latest prices are selected by market timestamp descending, then row ID for ties.
-Missing symbols return 404; numeric price/size/ID fields retain their string format.
+Missing symbols return 404. Latest-price responses encode price, size, and trade ID as strings; trade-history responses encode price as a string and size/trade ID as integers.
 
 - `PORT`: defaults to `3001`; binds to `0.0.0.0` for container hosting.
 - `CORS_ALLOWED_ORIGINS`: comma-separated dashboard origins; defaults to
@@ -474,3 +467,14 @@ curl 'http://localhost:3001/alerts?limit=5'
 ```
 
 CORS controls browser access, not authentication. These routes expose read-only market data.
+
+
+## Validation
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+Database integration tests are ignored by default and require `TEST_DATABASE_URL`; commands are documented in the relevant sections above. Unit tests do not require live Alpaca credentials. Do not use a production database for integration tests.
