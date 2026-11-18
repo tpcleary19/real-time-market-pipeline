@@ -77,5 +77,5 @@ See `crates/spike-detector/src/event.rs` (`schema_version = 1`). Kafka key = sym
 - Lag is computed with sequential blocking watermark calls on the metrics tick and pauses consumption briefly.
 - The signal task failing to install would be treated as an immediate shutdown request.
 
-## Not verified
-The Kafka paths (`kafka.rs`, `main.rs`: publish, offset storage, warm-up) have not been run against a live broker; they compile and pass clippy. Unit tests cover the pure core.
+## Verification status
+The Kafka paths (`kafka.rs`, `main.rs`) were exercised by 7 broker integration tests (`--ignored`; see `docs/spike-detector-testing.md`) against a single local Kafka 4.1.0 broker: all passed. Not verified: a multi-broker cluster, real `market-producer` traffic, load/performance, the `kafka-init` compose wiring (only its command was run), and an `earliest`/`latest` matrix beyond the cases the tests use.
