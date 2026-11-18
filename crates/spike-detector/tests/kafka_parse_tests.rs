@@ -37,7 +37,10 @@ fn malformed_payloads_do_not_panic() {
         Some(&[0xff, 0xfe, 0x00, 0x80]),
     ];
     for c in cases {
-        assert!(matches!(parse_trade(c, now, 300), Parsed::Malformed), "case {c:?}");
+        assert!(
+            matches!(parse_trade(c, now, 300), Parsed::Malformed),
+            "case {c:?}"
+        );
     }
 }
 
@@ -45,7 +48,13 @@ fn malformed_payloads_do_not_panic() {
 fn future_skew_boundary() {
     let now = at(0);
     let ok = json("1.0", &(now + Duration::seconds(300)).to_rfc3339());
-    assert!(matches!(parse_trade(Some(ok.as_bytes()), now, 300), Parsed::Trade(_)), "exactly at skew is allowed");
+    assert!(
+        matches!(parse_trade(Some(ok.as_bytes()), now, 300), Parsed::Trade(_)),
+        "exactly at skew is allowed"
+    );
     let bad = json("1.0", &(now + Duration::seconds(301)).to_rfc3339());
-    assert!(matches!(parse_trade(Some(bad.as_bytes()), now, 300), Parsed::Future));
+    assert!(matches!(
+        parse_trade(Some(bad.as_bytes()), now, 300),
+        Parsed::Future
+    ));
 }
