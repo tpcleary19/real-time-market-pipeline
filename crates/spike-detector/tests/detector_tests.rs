@@ -24,7 +24,11 @@ fn upward_spike_detected() {
     assert_eq!(e.window_seconds, 600);
     assert_eq!(e.baseline_timestamp, at(0));
     assert_eq!(e.current_timestamp, at(30));
-    assert_eq!(e.detected_at, detected(), "detected_at must be the injected value");
+    assert_eq!(
+        e.detected_at,
+        detected(),
+        "detected_at must be the injected value"
+    );
     assert_eq!(e.schema_version, 1);
     assert_eq!(e.event_id, event_id("AAPL", Direction::Up, 2, at(30)));
 }
@@ -54,10 +58,18 @@ fn below_threshold_no_event() {
 fn exact_threshold_is_inclusive_up_and_down() {
     let mut d = det();
     feed(&mut d, &trade("UP", 1, 100.0, 0));
-    assert_eq!(feed(&mut d, &trade("UP", 2, 105.0, 1)).len(), 1, "+5.0% exactly must fire");
+    assert_eq!(
+        feed(&mut d, &trade("UP", 2, 105.0, 1)).len(),
+        1,
+        "+5.0% exactly must fire"
+    );
     let mut d = det();
     feed(&mut d, &trade("DN", 1, 100.0, 0));
-    assert_eq!(feed(&mut d, &trade("DN", 2, 95.0, 1)).len(), 1, "-5.0% exactly must fire");
+    assert_eq!(
+        feed(&mut d, &trade("DN", 2, 95.0, 1)).len(),
+        1,
+        "-5.0% exactly must fire"
+    );
 }
 
 #[test]
@@ -105,7 +117,11 @@ fn expiry_bounds_retained_state() {
     }
     assert!(d.retained_trades() <= 100);
     feed(&mut d, &trade("A", 1000, 100.0, 5000));
-    assert!(d.retained_trades() <= 2, "old trades must be evicted, got {}", d.retained_trades());
+    assert!(
+        d.retained_trades() <= 2,
+        "old trades must be evicted, got {}",
+        d.retained_trades()
+    );
 }
 
 // 6
@@ -140,7 +156,10 @@ fn symbols_are_isolated() {
 
 #[test]
 fn new_symbol_at_cap_is_rejected_without_eviction() {
-    let mut d = Detector::new(Config { max_symbols: 2, ..cfg() });
+    let mut d = Detector::new(Config {
+        max_symbols: 2,
+        ..cfg()
+    });
     feed(&mut d, &trade("A", 1, 100.0, 0));
     feed(&mut d, &trade("B", 1, 100.0, 1));
     assert!(feed(&mut d, &trade("C", 1, 100.0, 2)).is_empty());
@@ -154,7 +173,10 @@ fn new_symbol_at_cap_is_rejected_without_eviction() {
 
 #[test]
 fn idle_symbols_are_cleaned_up_and_free_capacity() {
-    let mut d = Detector::new(Config { max_symbols: 2, ..cfg() });
+    let mut d = Detector::new(Config {
+        max_symbols: 2,
+        ..cfg()
+    });
     feed(&mut d, &trade("A", 1, 100.0, 0));
     feed(&mut d, &trade("B", 1, 100.0, 1));
     // B stays active; A idle for > window.
@@ -190,12 +212,20 @@ fn cooldown_is_per_direction() {
 // 9: use a wide window so the baseline survives past the (short) cooldown.
 #[test]
 fn cooldown_expires_in_event_time() {
-    let mut d = Detector::new(Config { window_seconds: 10_000, cooldown_seconds: 100, ..cfg() });
+    let mut d = Detector::new(Config {
+        window_seconds: 10_000,
+        cooldown_seconds: 100,
+        ..cfg()
+    });
     feed(&mut d, &trade("A", 1, 100.0, 0));
     assert_eq!(feed(&mut d, &trade("A", 2, 106.0, 10)).len(), 1);
     assert!(feed(&mut d, &trade("A", 3, 107.0, 50)).is_empty());
     let ev = feed(&mut d, &trade("A", 4, 108.0, 500));
-    assert_eq!(ev.len(), 1, "cooldown elapsed in event time; new event allowed");
+    assert_eq!(
+        ev.len(),
+        1,
+        "cooldown elapsed in event time; new event allowed"
+    );
     assert_eq!(ev[0].current_price, 108.0);
 }
 
@@ -211,7 +241,11 @@ fn cooldown_ignores_wall_clock_detected_at() {
 
 #[test]
 fn cooldown_boundary_is_exact() {
-    let c = Config { window_seconds: 10_000, cooldown_seconds: 100, ..cfg() };
+    let c = Config {
+        window_seconds: 10_000,
+        cooldown_seconds: 100,
+        ..cfg()
+    };
     let run = |second_at: i64| {
         let mut d = Detector::new(c.clone());
         feed(&mut d, &trade("A", 1, 100.0, 0));
@@ -231,22 +265,36 @@ fn duplicate_trade_is_ignored() {
     assert_eq!(feed(&mut d, &t).len(), 1);
     let before = d.retained_trades();
     assert!(feed(&mut d, &t).is_empty());
-    assert_eq!(d.retained_trades(), before, "duplicate must not be retained twice");
+    assert_eq!(
+        d.retained_trades(),
+        before,
+        "duplicate must not be retained twice"
+    );
 }
 
 #[test]
 fn duplicate_does_not_emit_even_with_no_cooldown() {
-    let mut d = Detector::new(Config { cooldown_seconds: 0, ..cfg() });
+    let mut d = Detector::new(Config {
+        cooldown_seconds: 0,
+        ..cfg()
+    });
     feed(&mut d, &trade("A", 1, 100.0, 0));
     let t = trade("A", 2, 106.0, 10);
     assert_eq!(feed(&mut d, &t).len(), 1);
-    assert!(feed(&mut d, &t).is_empty(), "redelivery of same trade must not re-emit");
+    assert!(
+        feed(&mut d, &t).is_empty(),
+        "redelivery of same trade must not re-emit"
+    );
 }
 
 #[test]
 fn same_trade_id_on_different_et_date_is_not_duplicate() {
     // Wide window so the baseline survives across the date change.
-    let mut d = Detector::new(Config { window_seconds: 200_000, cooldown_seconds: 0, ..cfg() });
+    let mut d = Detector::new(Config {
+        window_seconds: 200_000,
+        cooldown_seconds: 0,
+        ..cfg()
+    });
     feed(&mut d, &trade("A", 1, 100.0, 0)); // 2024-01-02 ET
     // Same id one day later (2024-01-03 ET): a new trade, must be processed.
     assert_eq!(feed(&mut d, &trade("A", 1, 110.0, 86_400)).len(), 1);
@@ -310,9 +358,17 @@ fn invalid_trades_rejected_without_panic() {
         trade("A\u{0}B", 11, 100.0, 10),
     ];
     for t in &bad {
-        assert!(feed(&mut d, t).is_empty(), "invalid trade {:?} emitted an event", t.symbol);
+        assert!(
+            feed(&mut d, t).is_empty(),
+            "invalid trade {:?} emitted an event",
+            t.symbol
+        );
     }
-    assert_eq!(d.retained_trades(), before, "invalid trades must not be retained");
+    assert_eq!(
+        d.retained_trades(),
+        before,
+        "invalid trades must not be retained"
+    );
     assert_eq!(d.symbol_count(), 1, "invalid symbols must not create state");
 }
 
@@ -389,10 +445,18 @@ fn replay_is_deterministic() {
 fn replay_with_different_wall_clock_yields_same_event_ids() {
     let s = stream();
     let mut d1 = det();
-    let ids1: Vec<_> = s.iter().flat_map(|t| d1.observe(t, detected())).map(|e| e.event_id).collect();
+    let ids1: Vec<_> = s
+        .iter()
+        .flat_map(|t| d1.observe(t, detected()))
+        .map(|e| e.event_id)
+        .collect();
     let mut d2 = det();
     let later = detected() + chrono::Duration::days(1);
-    let ids2: Vec<_> = s.iter().flat_map(|t| d2.observe(t, later)).map(|e| e.event_id).collect();
+    let ids2: Vec<_> = s
+        .iter()
+        .flat_map(|t| d2.observe(t, later))
+        .map(|e| e.event_id)
+        .collect();
     assert_eq!(ids1, ids2);
 }
 

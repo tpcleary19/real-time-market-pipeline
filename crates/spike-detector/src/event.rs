@@ -36,7 +36,12 @@ pub struct SpikeEvent {
 }
 
 /// Stable across replays: derived only from event-time data, never wall clock.
-pub fn event_id(symbol: &str, direction: Direction, current_trade_id: i64, current_ts: DateTime<Utc>) -> String {
+pub fn event_id(
+    symbol: &str,
+    direction: Direction,
+    current_trade_id: i64,
+    current_ts: DateTime<Utc>,
+) -> String {
     format!(
         "{symbol}-{}-{current_trade_id}-{}",
         direction.as_str(),

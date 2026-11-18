@@ -2,8 +2,8 @@
 #![allow(dead_code)]
 use chrono::{DateTime, TimeZone, Utc};
 use market_events::Trade;
-use spike_detector::detector::{Config, Detector};
 use spike_detector::SpikeEvent;
+use spike_detector::detector::{Config, Detector};
 
 /// 2024-01-02 15:00:00Z = 10:00 ET (a Tuesday, mid-session).
 pub fn t0() -> DateTime<Utc> {
@@ -20,11 +20,24 @@ pub fn detected() -> DateTime<Utc> {
 }
 
 pub fn cfg() -> Config {
-    Config { window_seconds: 600, threshold_percent: 5.0, cooldown_seconds: 600, max_symbols: 1000 }
+    Config {
+        window_seconds: 600,
+        threshold_percent: 5.0,
+        cooldown_seconds: 600,
+        max_symbols: 1000,
+    }
 }
 
 pub fn trade_at(sym: &str, id: i64, price: f64, ts: DateTime<Utc>) -> Trade {
-    Trade { trade_id: id, symbol: sym.to_string(), price, size: 100, timestamp: ts, exchange: Some("V".into()), tape: Some("C".into()) }
+    Trade {
+        trade_id: id,
+        symbol: sym.to_string(),
+        price,
+        size: 100,
+        timestamp: ts,
+        exchange: Some("V".into()),
+        tape: Some("C".into()),
+    }
 }
 
 pub fn trade(sym: &str, id: i64, price: f64, offset_secs: i64) -> Trade {

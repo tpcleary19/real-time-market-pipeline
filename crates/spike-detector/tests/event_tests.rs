@@ -35,8 +35,17 @@ fn wire_format_field_names_and_types() {
     let mut keys: Vec<_> = o.keys().cloned().collect();
     keys.sort();
     let mut want = vec![
-        "schema_version", "event_id", "symbol", "direction", "baseline_price", "current_price",
-        "percentage_change", "window_seconds", "baseline_timestamp", "current_timestamp", "detected_at",
+        "schema_version",
+        "event_id",
+        "symbol",
+        "direction",
+        "baseline_price",
+        "current_price",
+        "percentage_change",
+        "window_seconds",
+        "baseline_timestamp",
+        "current_timestamp",
+        "detected_at",
     ];
     want.sort();
     assert_eq!(keys, want);
@@ -59,8 +68,19 @@ fn direction_serializes_uppercase() {
 
 #[test]
 fn rejects_malformed_payloads_without_panic() {
-    for bad in ["", "{}", "null", "[]", "{\"schema_version\":1}", "not json", "{\"direction\":\"SIDEWAYS\"}"] {
-        assert!(serde_json::from_str::<SpikeEvent>(bad).is_err(), "accepted: {bad}");
+    for bad in [
+        "",
+        "{}",
+        "null",
+        "[]",
+        "{\"schema_version\":1}",
+        "not json",
+        "{\"direction\":\"SIDEWAYS\"}",
+    ] {
+        assert!(
+            serde_json::from_str::<SpikeEvent>(bad).is_err(),
+            "accepted: {bad}"
+        );
     }
 }
 
@@ -81,10 +101,16 @@ fn detector_event_roundtrips_through_json() {
     use spike_detector::detector::Detector;
     let mut d = Detector::new(cfg());
     feed(&mut d, &trade("AAPL", 1, 100.0, 0));
-    let ev = feed(&mut d, &trade("AAPL", 2, 106.1234567, 5)).pop().unwrap();
+    let ev = feed(&mut d, &trade("AAPL", 2, 106.1234567, 5))
+        .pop()
+        .unwrap();
     let back: SpikeEvent = serde_json::from_str(&serde_json::to_string(&ev).unwrap()).unwrap();
     assert_eq!(ev, back);
     // Lead decision 7: percentage_change rounded to 4 dp.
     let scaled = ev.percentage_change * 10_000.0;
-    assert!((scaled - scaled.round()).abs() < 1e-6, "not 4dp: {}", ev.percentage_change);
+    assert!(
+        (scaled - scaled.round()).abs() < 1e-6,
+        "not 4dp: {}",
+        ev.percentage_change
+    );
 }
