@@ -8,4 +8,5 @@ members = [
     "crates/query-api",
     "crates/portfolio-domain",
     "crates/load-generator",
+    "crates/spike-detector",
 ]
