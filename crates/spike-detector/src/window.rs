@@ -26,12 +26,27 @@ pub enum Admit {
 
 #[derive(Debug, Default)]
 pub struct SymbolWindow {
+    cap: Option<usize>,
+    cap_evictions: u64,
     entries: VecDeque<(Entry, TradeKey)>,
     ids: HashSet<TradeKey>,
     latest: Option<DateTime<Utc>>,
 }
 
 impl SymbolWindow {
+    /// Window with a custom per-symbol cap (tests); `default()` uses [`MAX_TRADES_PER_SYMBOL`].
+    pub fn with_cap(cap: usize) -> Self {
+        Self {
+            cap: Some(cap),
+            ..Self::default()
+        }
+    }
+
+    /// Number of trades discarded early by the cap since the last call.
+    pub fn take_cap_evictions(&mut self) -> u64 {
+        std::mem::take(&mut self.cap_evictions)
+    }
+
     /// Try to add a trade. Trades older than the latest accepted trade are rejected;
     /// trades with equal timestamps are accepted unless the id was already seen.
     pub fn push(&mut self, entry: Entry, window: Duration) -> Admit {
@@ -49,8 +64,10 @@ impl SymbolWindow {
         self.expire(entry.ts, window);
         self.ids.insert(key);
         self.entries.push_back((entry, key));
-        while self.entries.len() > MAX_TRADES_PER_SYMBOL {
+        let cap = self.cap.unwrap_or(MAX_TRADES_PER_SYMBOL);
+        while self.entries.len() > cap {
             self.pop_front();
+            self.cap_evictions += 1;
         }
         Admit::Accepted
     }
@@ -112,6 +129,19 @@ mod tests {
         assert_eq!(win.push(e(11, 3.0, 3), w), Admit::Accepted);
         assert_eq!(win.baseline().unwrap().trade_id, 2);
         assert_eq!(win.len(), 2);
+    }
+
+    #[test]
+    fn cap_evictions_are_counted() {
+        let w = Duration::seconds(1000);
+        let mut win = SymbolWindow::with_cap(2);
+        for i in 0..5 {
+            win.push(e(i, 1.0, i), w);
+        }
+        assert_eq!(win.len(), 2);
+        assert_eq!(win.baseline().unwrap().trade_id, 3);
+        assert_eq!(win.take_cap_evictions(), 3);
+        assert_eq!(win.take_cap_evictions(), 0);
     }
 
     #[test]

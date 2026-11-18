@@ -37,6 +37,8 @@ pub struct Stats {
     pub suppressed_by_cooldown: u64,
     pub dropped_symbol_capacity: u64,
     pub evicted_symbols: u64,
+    /// Trades discarded early because a symbol exceeded the per-symbol retention cap.
+    pub evicted_by_cap: u64,
 }
 
 pub struct Detector {
@@ -109,6 +111,7 @@ impl Detector {
             Admit::Accepted => {}
         }
         self.stats.trades_accepted += 1;
+        self.stats.evicted_by_cap += win.take_cap_evictions();
         self.watermark = Some(
             self.watermark
                 .map_or(trade.timestamp, |w| w.max(trade.timestamp)),
@@ -228,6 +231,17 @@ mod tests {
         d.observe(&t("A", 5, 100.0, 5), now());
         let s = d.stats();
         assert_eq!((s.invalid, s.duplicates, s.out_of_order), (3, 1, 1));
+    }
+
+    #[test]
+    fn per_symbol_cap_evictions_counted() {
+        let mut d = Detector::new(cfg());
+        let cap = crate::window::MAX_TRADES_PER_SYMBOL as i64;
+        for i in 0..cap + 5 {
+            d.observe(&t("A", i, 100.0, 0), now());
+        }
+        assert_eq!(d.stats().evicted_by_cap, 5);
+        assert_eq!(d.retained_trades(), cap as usize);
     }
 
     #[test]

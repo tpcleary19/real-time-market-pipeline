@@ -35,7 +35,7 @@ impl Metrics {
         eprintln!(
             "{} METRICS consumed={} malformed={} future_rejected={} invalid={} accepted={} duplicates={} out_of_order={} \
              spikes_detected={} suppressed_cooldown={} published={} publish_errors={} dropped_capacity={} \
-             evicted_symbols={} active_symbols={} retained_trades={} lag={} latency_avg_us={} latency_max_us={}",
+             evicted_symbols={} evicted_by_cap={} active_symbols={} retained_trades={} lag={} latency_avg_us={} latency_max_us={}",
             Local::now(),
             self.consumed,
             self.malformed,
@@ -50,6 +50,7 @@ impl Metrics {
             self.publish_errors,
             stats.dropped_symbol_capacity,
             stats.evicted_symbols,
+            stats.evicted_by_cap,
             symbols,
             retained,
             lag.map_or("unknown".to_string(), |l| l.to_string()),

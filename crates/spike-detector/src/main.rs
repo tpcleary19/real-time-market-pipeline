@@ -7,7 +7,7 @@ use rdkafka::{
 use spike_detector::{
     config::Settings,
     detector::Detector,
-    kafka::{self, Parsed},
+    kafka::{self, Parsed, WarmUp},
     metrics::Metrics,
 };
 use std::time::{Duration, Instant};
@@ -29,13 +29,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut detector = Detector::new(settings.detector_config());
     let mut metrics = Metrics::default();
 
-    kafka::assign_and_warm_up(
+    match kafka::assign_and_warm_up(
         &consumer,
         &settings,
         &mut detector,
         &mut metrics.next_offsets,
+        &mut stop_rx,
     )
-    .await?;
+    .await
+    {
+        Ok(WarmUp::Ready) => {}
+        Ok(WarmUp::Shutdown) => {
+            eprintln!("{} shutdown requested during startup", Local::now());
+            return Ok(());
+        }
+        Err(e) => {
+            eprintln!("{} FATAL startup failure: {e}", Local::now());
+            std::process::exit(1);
+        }
+    }
     eprintln!(
         "{} spike-detector consuming {}",
         Local::now(),
@@ -45,6 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut tick = tokio::time::interval(Duration::from_secs(settings.metrics_interval_seconds));
     tick.tick().await;
 
+    let mut failed = false;
     'main: loop {
         tokio::select! {
             _ = stop_rx.changed() => break,
@@ -77,8 +90,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 // Shutdown mid-publish: leave the offset unstored so the record replays.
                                 Ok(false) => break 'main,
                                 Err(e) => {
-                                    // Serialization of a finite-valued event should not fail; never skip silently.
-                                    eprintln!("{} cannot serialize event {}: {e}", Local::now(), event.event_id);
+                                    // Never skip: leave the offset unstored so a restart replays the record.
+                                    eprintln!("{} FATAL {e}; exiting without storing offset", Local::now());
+                                    failed = true;
                                     break 'main;
                                 }
                             }
@@ -106,6 +120,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("{} shutting down", Local::now());
     match consumer.commit_consumer_state(CommitMode::Sync) {
         Ok(()) => {}
+        // Nothing stored since the last commit: not an error.
+        Err(e) if e.rdkafka_error_code() == Some(rdkafka::error::RDKafkaErrorCode::NoOffset) => {}
         Err(e) => eprintln!("{} final commit: {e}", Local::now()),
     }
     let _ = producer.flush(Duration::from_secs(10));
@@ -115,6 +131,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         detector.retained_trades(),
         None,
     );
+    if failed {
+        std::process::exit(1);
+    }
     Ok(())
 }
 
