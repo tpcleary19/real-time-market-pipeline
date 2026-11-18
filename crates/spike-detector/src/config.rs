@@ -49,7 +49,7 @@ impl Settings {
             max_symbols: parse(get, "SPIKE_MAX_SYMBOLS", 10_000)?,
             metrics_interval_seconds: parse(get, "SPIKE_METRICS_INTERVAL_SECONDS", 30)?,
             auto_offset_reset: get("SPIKE_AUTO_OFFSET_RESET").unwrap_or_else(|| "latest".into()),
-            max_future_skew_seconds: parse(get, "SPIKE_MAX_FUTURE_SKEW_SECONDS", 300)?,
+            max_future_skew_seconds: parse(get, "SPIKE_MAX_FUTURE_SKEW_SECONDS", 30)?,
         };
         s.validate()?;
         Ok(s)
@@ -67,6 +67,9 @@ impl Settings {
         }
         if self.max_symbols == 0 || self.metrics_interval_seconds == 0 {
             return Err("SPIKE_MAX_SYMBOLS and SPIKE_METRICS_INTERVAL_SECONDS must be > 0".into());
+        }
+        if !(0..=3600).contains(&self.max_future_skew_seconds) {
+            return Err("SPIKE_MAX_FUTURE_SKEW_SECONDS must be in 0..=3600".into());
         }
         if !matches!(self.auto_offset_reset.as_str(), "latest" | "earliest") {
             return Err("SPIKE_AUTO_OFFSET_RESET must be latest or earliest".into());
@@ -99,6 +102,22 @@ mod tests {
         let s = Settings::from_lookup(&|k| (k == "SPIKE_THRESHOLD_PERCENT").then(|| "2.5".into()))
             .unwrap();
         assert_eq!(s.threshold_percent, 2.5);
+    }
+
+    #[test]
+    fn skew_default_and_range() {
+        let s = Settings::from_lookup(&|_| None).unwrap();
+        assert_eq!(s.max_future_skew_seconds, 30);
+        for bad in ["-1", "3601", "9223372036854775807", "abc"] {
+            let r = Settings::from_lookup(&|k| {
+                (k == "SPIKE_MAX_FUTURE_SKEW_SECONDS").then(|| bad.to_string())
+            });
+            assert!(r.is_err(), "{bad} should be rejected");
+        }
+        assert!(
+            Settings::from_lookup(&|k| (k == "SPIKE_MAX_FUTURE_SKEW_SECONDS").then(|| "0".into()))
+                .is_ok()
+        );
     }
 
     #[test]
