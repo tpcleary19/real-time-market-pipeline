@@ -412,7 +412,7 @@ At completion, provide a concise report containing:
 
 ## 15. Stop Condition
 
-**For the initial implementation, stop when the Rust spike detector is implemented, tested, documented, and ready for review. For the follow-up assignment in Section 16, stop when that additional task is implemented, tested, documented, and ready for review.**
+**Once the Rust spike detector is implemented, tested, documented, and ready for review, STOP.**
 
 Do not proceed to building the AI investigation harness.
 
@@ -422,67 +422,10 @@ The objective is a reliable, independently operating spike detector that emits u
 
 ---
 
-## 16. Additional Task: Persist Spikes Before Downstream Publication
+## 16. Persistence Ownership Decision
 
-### Goal and Scope
+Spike persistence to PostgreSQL belongs to the future AI investigation harness, which will consume `price-spikes`. Do not add PostgreSQL writes, a database dependency, or a transactional outbox to `spike-detector`; it remains responsible for detecting spikes and publishing them to Kafka with its documented delivery and recovery guarantees.
 
-Extend the existing `spike-detector` service to persist detected spikes in PostgreSQL before publishing them to `price-spikes`, using a transactional outbox. The persisted spikes must also be available through the existing alert history API.
+The future harness will use the existing `DATABASE_URL` configuration (Neon when configured) for runtime persistence. Database integration tests must use a separate `TEST_DATABASE_URL`. Harness implementation and any work needed to expose its persisted spikes through the existing alert API remain outside this detector assignment.
 
-This is a follow-up to the initial implementation. Inspect the current code and documentation first and preserve its detection behavior and event contract. This section supersedes the publish-before-source-offset-commit requirement in Section 5 and the initial stop condition only where necessary for the durable outbox design. All other applicable requirements remain in force.
-
-**Do not delete or modify `pattern-detector` as part of this task.** The repository owner will remove it after validating this replacement. Do not implement the AI investigation harness or make dashboard changes.
-
-### Required Data Flow
-
-1. Consume a trade from `stock-trades` and evaluate it using the existing detector.
-2. For every detected spike, save the durable alert and its pending outbox event in one PostgreSQL transaction. Store the triggering source topic, partition, and offset for traceability.
-3. Only after that transaction commits may the source offset become eligible for Kafka commit. Records producing no spike may advance normally after processing.
-4. A background publisher independently reads committed pending outbox events, publishes them to `price-spikes` using the symbol as the key, waits for Kafka acknowledgment, and marks them sent in PostgreSQL.
-5. Pending events survive process restarts and are retried until delivered or explicitly surfaced for operator intervention. Never silently discard an event.
-
-PostgreSQL is now a required dependency for recording spikes. A downstream Kafka publication failure must not immediately block trade processing while PostgreSQL remains available and the pending backlog remains within documented operating limits. Do not wait for AI or other downstream consumers.
-
-### Persistence and API Compatibility
-
-- Add numbered, additive SQL migrations following repository conventions. Preserve existing alert history and allow `pattern-detector` to continue operating during migration. Do not rewrite applied migrations or drop existing tables/data.
-- Use stable `event_id` values with database uniqueness constraints to make spike and outbox insertion idempotent under source replay, ambiguous database commit results, and retries. A duplicate replay must not reset an already-sent outbox row to pending.
-- Persist the complete versioned event payload so retries publish the same event, including the original `detected_at`, without reconstructing it from current detector state.
-- Preserve `GET /alerts` and `GET /alerts/{symbol}`, their response fields, filters, ordering, and access to historical alerts. Prefer reusing `pattern_alerts` if practical; if a new table is chosen, adapt the API while preserving old history.
-- Map `UP`/`DOWN` to the API's existing `Up`/`Down`, `percentage_change` to `movement_percent`, `current_price` to `price`, `baseline_timestamp` to `window_start`, and `current_timestamp` to `event_timestamp`.
-- Retain the existing configurable window, threshold, and cooldown semantics. Document that spike-detector defaults differ from pattern-detector; this task does not require identical alert timing or counts.
-
-### Reliability and Recovery
-
-- Do not advance a source offset past a spike whose database transaction has not successfully committed. Retry transient database failures without consuming onward in a way that loses the spike or advances past it. Handle ambiguous commit results through idempotent retries.
-- Reconcile restart warm-up with the new acknowledgment boundary: committed source offsets now mean spikes are durably recorded, not necessarily published. Previously recorded pending events must be delivered by the outbox publisher even when warm-up suppresses replay output. Preserve recovery of rolling-window and cooldown state and document remaining assumptions.
-- Keep downstream delivery at-least-once. A crash after Kafka acknowledgment but before marking an outbox row sent can publish a duplicate; consumers must deduplicate by `event_id`. Do not claim exactly-once delivery across PostgreSQL and Kafka.
-- Keep producer acknowledgments and safe retry behavior. Track attempt counts, last error, and retry timing; avoid hot retry loops and make permanent errors visible without dropping pending events.
-- Define ordering and concurrency behavior, including per-symbol event ordering during retries. Prevent concurrent workers from incorrectly marking unsent events as sent. A single publisher is acceptable if its supported deployment assumptions are explicit.
-- Handle shutdown during persistence and publication safely. On startup, resume pending publication without requiring a new incoming trade.
-- Define indexes, batch sizes, backlog monitoring, and retention/cleanup for sent outbox records. Never remove unsent events automatically. Document disk/backlog limits and what happens when capacity is exhausted.
-- Expose useful logs/metrics for database failures, pending outbox count, oldest pending age, successful publication, retry failures, and publisher health. Document behavior during database and Kafka outages.
-
-### Testing and Validation
-
-Add meaningful deterministic tests and PostgreSQL/Kafka integration tests covering:
-
-1. A persisted spike is visible through the existing alert API with the expected field mapping and filters; old alert history remains accessible.
-2. Alert and outbox insertion are atomic: a failed transaction leaves neither record, and the source offset cannot advance past that failure.
-3. Replaying a source record or retrying an ambiguous database commit produces one durable spike and one outbox record.
-4. Pending events survive restart and publish without another trade arriving.
-5. Kafka output failure leaves events pending while additional spikes can still be persisted.
-6. A crash after database commit but before source offset commit safely replays without duplicate database rows.
-7. A crash after Kafka acknowledgment but before the sent marker safely retries with the same event ID and payload; downstream deduplication is demonstrated.
-8. Warm-up after a committed source offset does not lose pending outbox events or break window/cooldown recovery.
-9. Shutdown, retry scheduling, permanent publication errors, and the chosen ordering/concurrency guarantees behave as documented.
-
-Use synthetic trades and isolated test data. Run formatting, linting, and relevant tests. Report exactly which infrastructure-backed tests ran and which could not run; provide reproducible commands for the latter.
-
-### Deliverables and Completion
-
-- Working persistence and outbox publication integrated into `spike-detector`, with migrations, tests, configuration, and operational documentation.
-- Updated delivery/recovery documentation replacing the current publish-before-offset-commit description, including the new PostgreSQL dependency and known limitations.
-- A migration and cutover guide: apply migrations, start the updated service, verify database/API and Kafka output, and explain how to avoid duplicate user-visible alerts if both detectors run during validation. Identify remaining `pattern-detector` references and any other prerequisites for the owner's later removal; leave its crate and historical data intact.
-- A review-ready feature branch and pull request, following the existing reporting and no-merge/no-production-deployment rules.
-
-**Stop once this follow-up is implemented, tested, documented, and ready for review. The owner will validate it and delete `pattern-detector` separately.**
+Leave `pattern-detector` intact. The owner will remove it separately after the replacement persistence path and alert API compatibility have been implemented and validated.
