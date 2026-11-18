@@ -8,7 +8,7 @@ Run: `cargo test -p spike-detector` (no Kafka needed; all tests use synthetic ev
 - `event_tests.rs`: item 14 (JSON round trip, field names, uppercase direction, pinned `event_id` format, malformed payload rejection, 4 dp rounding).
 
 ## Assumptions encoded (from plan.md decisions)
-Boundary inclusive; window edge inclusive; late = older than latest for the symbol (equal timestamps allowed); invalid symbol = empty/whitespace/lowercase/over-long/control chars (impl must confirm its symbol rule); cooldown expiry tested only well past the boundary.
+Boundary inclusive; window edge inclusive; late = older than latest for the symbol (equal timestamps allowed); invalid symbol = empty, whitespace-only, or control chars only (lead ruling); cooldown: elapsed >= cooldown permits, < suppresses (exact-boundary test); max_symbols: new symbol at cap rejected, idle symbols cleaned up.
 
 ## Not covered
 Kafka integration (consumption, publish, offset-store ordering, producer failure) is NOT written or executed: it needs the impl's `kafka.rs` API and a broker. Warm-up is tested only as replay determinism of the pure core.

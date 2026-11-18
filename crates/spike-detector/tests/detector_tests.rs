@@ -139,12 +139,30 @@ fn symbols_are_isolated() {
 }
 
 #[test]
-fn max_symbols_bounds_state() {
-    let mut d = Detector::new(Config { max_symbols: 3, ..cfg() });
-    for i in 0..10 {
-        feed(&mut d, &trade(&format!("S{i}"), 1, 10.0, i));
-    }
-    assert!(d.symbol_count() <= 3, "got {}", d.symbol_count());
+fn new_symbol_at_cap_is_rejected_without_eviction() {
+    let mut d = Detector::new(Config { max_symbols: 2, ..cfg() });
+    feed(&mut d, &trade("A", 1, 100.0, 0));
+    feed(&mut d, &trade("B", 1, 100.0, 1));
+    assert!(feed(&mut d, &trade("C", 1, 100.0, 2)).is_empty());
+    assert_eq!(d.symbol_count(), 2);
+    // C was rejected, so it never got a baseline.
+    assert!(feed(&mut d, &trade("C", 2, 120.0, 3)).is_empty());
+    assert_eq!(d.symbol_count(), 2);
+    // Existing symbols are unaffected.
+    assert_eq!(feed(&mut d, &trade("A", 2, 110.0, 4)).len(), 1);
+}
+
+#[test]
+fn idle_symbols_are_cleaned_up_and_free_capacity() {
+    let mut d = Detector::new(Config { max_symbols: 2, ..cfg() });
+    feed(&mut d, &trade("A", 1, 100.0, 0));
+    feed(&mut d, &trade("B", 1, 100.0, 1));
+    // B stays active; A idle for > window.
+    feed(&mut d, &trade("B", 2, 100.0, 700));
+    feed(&mut d, &trade("C", 1, 100.0, 701));
+    assert!(d.symbol_count() <= 2);
+    // C must have been admitted: a spike on it is detected.
+    assert_eq!(feed(&mut d, &trade("C", 2, 110.0, 702)).len(), 1);
 }
 
 // 8
@@ -191,6 +209,19 @@ fn cooldown_ignores_wall_clock_detected_at() {
     assert!(d.observe(&trade("A", 3, 107.0, 20), far).is_empty());
 }
 
+#[test]
+fn cooldown_boundary_is_exact() {
+    let c = Config { window_seconds: 10_000, cooldown_seconds: 100, ..cfg() };
+    let run = |second_at: i64| {
+        let mut d = Detector::new(c.clone());
+        feed(&mut d, &trade("A", 1, 100.0, 0));
+        assert_eq!(feed(&mut d, &trade("A", 2, 106.0, 10)).len(), 1);
+        feed(&mut d, &trade("A", 3, 107.0, second_at)).len()
+    };
+    assert_eq!(run(10 + 99), 0, "elapsed < cooldown must suppress");
+    assert_eq!(run(10 + 100), 1, "elapsed == cooldown must publish");
+}
+
 // 10
 #[test]
 fn duplicate_trade_is_ignored() {
@@ -210,6 +241,15 @@ fn duplicate_does_not_emit_even_with_no_cooldown() {
     let t = trade("A", 2, 106.0, 10);
     assert_eq!(feed(&mut d, &t).len(), 1);
     assert!(feed(&mut d, &t).is_empty(), "redelivery of same trade must not re-emit");
+}
+
+#[test]
+fn same_trade_id_on_different_et_date_is_not_duplicate() {
+    // Wide window so the baseline survives across the date change.
+    let mut d = Detector::new(Config { window_seconds: 200_000, cooldown_seconds: 0, ..cfg() });
+    feed(&mut d, &trade("A", 1, 100.0, 0)); // 2024-01-02 ET
+    // Same id one day later (2024-01-03 ET): a new trade, must be processed.
+    assert_eq!(feed(&mut d, &trade("A", 1, 110.0, 86_400)).len(), 1);
 }
 
 #[test]
@@ -267,8 +307,6 @@ fn invalid_trades_rejected_without_panic() {
         trade("A", 6, f64::NEG_INFINITY, 5),
         trade("", 7, 100.0, 6),
         trade("   ", 8, 100.0, 7),
-        trade("lower", 9, 100.0, 8),
-        trade("WAYTOOLONGSYMBOLNAME", 10, 100.0, 9),
         trade("A\u{0}B", 11, 100.0, 10),
     ];
     for t in &bad {
@@ -276,6 +314,14 @@ fn invalid_trades_rejected_without_panic() {
     }
     assert_eq!(d.retained_trades(), before, "invalid trades must not be retained");
     assert_eq!(d.symbol_count(), 1, "invalid symbols must not create state");
+}
+
+#[test]
+fn dotted_and_mixed_tickers_are_valid() {
+    let mut d = det();
+    feed(&mut d, &trade("BRK.B", 1, 100.0, 0));
+    assert_eq!(feed(&mut d, &trade("BRK.B", 2, 106.0, 1)).len(), 1);
+    assert_eq!(d.symbol_count(), 1);
 }
 
 #[test]
