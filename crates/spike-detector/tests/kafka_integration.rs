@@ -126,6 +126,20 @@ async fn send_raw_p(topic: &str, part: i32, payload: Option<&[u8]>) {
     p.send(r, Duration::from_secs(10)).await.map_err(|e| e.0).expect("produce");
 }
 
+/// Bulk-produce `n` flat-price trades for `sym` to one partition.
+async fn send_many(topic: &str, part: i32, sym: &str, n: i64, base_off: i64) {
+    let p = producer();
+    let mut futs = Vec::new();
+    for i in 0..n {
+        let payload = trade_json(sym, i + 1, 100.0, base_off + i % 30);
+        let rec = FutureRecord::to(topic).key("k").partition(part).payload(payload.as_bytes());
+        futs.push(p.send_result(rec).map_err(|x| x.0).expect("enqueue"));
+    }
+    for f in futs {
+        f.await.expect("delivery").map_err(|x| x.0).expect("delivered");
+    }
+}
+
 fn trade_json(sym: &str, id: i64, price: f64, offset_secs: i64) -> String {
     // Event times are in the past relative to now (never trips the future-skew guard).
     let ts = chrono::Utc::now() - chrono::Duration::seconds(300) + chrono::Duration::seconds(offset_secs);
@@ -306,33 +320,24 @@ async fn hard_kill_mid_run_loses_no_spike_and_restores_cooldown() {
 async fn partition_without_committed_offset_is_still_processed_after_restart() {
     let e = Env::with_partitions("twopart", 2).await;
     // Run 1: only partition 0 has data, so only p0 gets a committed offset.
-    // Many p0 records so warm-up of p0 is still running when p1's records arrive.
-    {
-        let p = producer();
-        let mut futs = Vec::new();
-        for i in 0..5000i64 {
-            let payload = trade_json("AAA", i + 1, 100.0, i % 30);
-            let rec = FutureRecord::to(&e.src).key("k").partition(0).payload(payload.as_bytes());
-            futs.push(p.send_result(rec).map_err(|x| x.0).expect("enqueue"));
-        }
-        for f in futs {
-            f.await.expect("delivery").map_err(|x| x.0).expect("delivered");
-        }
-    }
-    send_trade_p(&e.src, 0, "AAA", 100000, 106.0, 40).await; // spike (UP)
+    // Long p0 replay on restart, so p1's backlog is fetched while warm-up is still running.
+    send_many(&e.src, 0, "AAA", 50_000, 0).await;
+    send_trade_p(&e.src, 0, "AAA", 100_000, 106.0, 40).await; // spike (UP)
     let child = e.spawn(&e.out);
-    let first = read_out(&e.out, 1, Duration::from_secs(90), Duration::from_secs(1));
+    let first = read_out(&e.out, 1, Duration::from_secs(120), Duration::from_secs(1));
     assert_eq!(first.len(), 1);
     stop(child);
-    assert_eq!(e.committed_p(0), Some(5001));
+    assert_eq!(e.committed_p(0), Some(50_001));
     assert_eq!(e.committed_p(1), None, "precondition: p1 has no committed offset");
-    // While down: p1 gets its first records, including a spike.
+    // While down: p1 gets its first records. Spike is EARLY in the backlog, then filler.
     send_trade_p(&e.src, 1, "ZZZ", 1, 50.0, 50).await;
     send_trade_p(&e.src, 1, "ZZZ", 2, 60.0, 60).await; // +20%
+    send_many(&e.src, 1, "YYY", 3000, 100).await;
     let child = e.spawn(&e.out);
-    let raw = read_out(&e.out, 2, Duration::from_secs(60), Duration::from_secs(3));
+    let raw = read_out(&e.out, 2, Duration::from_secs(120), Duration::from_secs(3));
     stop(child);
     let evs = events(&raw);
+    assert_eq!(e.committed_p(1), Some(3002), "every p1 record must be processed and its offset committed");
     assert!(evs.iter().any(|x| x.symbol == "ZZZ"), "records on the partition with no committed offset were dropped during warm-up; got {evs:?}");
     assert_eq!(evs.iter().filter(|x| x.symbol == "AAA").count(), 1, "AAA spike must not be republished");
     e.teardown().await;
