@@ -1701,9 +1701,12 @@ name = "spike-detector"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "chrono-tz",
  "market-events",
+ "rdkafka 0.39.0",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
