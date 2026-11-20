@@ -139,6 +139,7 @@ fn producer() -> FutureProducer {
         .set("bootstrap.servers", brokers())
         .set("acks", "all")
         .set("message.max.bytes", "2000000")
+        .set("queue.buffering.max.messages", "2000000")
         .create()
         .unwrap()
 }
@@ -185,9 +186,10 @@ fn read_out(topic: &str, settle: Duration) -> Vec<SpikeEvent> {
     let mut got = Vec::new();
     let start = Instant::now();
     while start.elapsed() < settle {
-        if let Some(Ok(m)) = c.poll(Duration::from_millis(200)) {
-            got.push(serde_json::from_slice(m.payload().unwrap()).unwrap());
-        }
+        if let Some(Ok(m)) = c.poll(Duration::from_millis(200))
+            && let Some(Ok(ev)) = m.payload().map(serde_json::from_slice) {
+                got.push(ev);
+            }
     }
     got
 }
@@ -335,7 +337,7 @@ async fn skeptic_latest_default_restart_keeps_records_produced_while_down() {
 /// Partitions added to the source topic while the service runs: not consumed until restart,
 /// and after a restart (default `latest`) records already in the new partition are skipped.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore]
+#[ignore = "documented limitation: partitions added while running are not read until restart, then start at latest"]
 async fn skeptic_added_partition_records_are_not_lost() {
     let e = Env::new("addpart", 1).await;
     let latest = [("SPIKE_AUTO_OFFSET_RESET", "latest")];
@@ -625,4 +627,209 @@ async fn skeptic_broker_restart_during_publishing() {
     );
     assert_eq!(ids.len(), 2000, "lost spikes");
     assert_eq!(committed, Some(total));
+}
+
+// ---- Follow-up pass: attacks on the fixes ----
+
+/// Trade with a Kafka record timestamp independent of the trade time `t`.
+async fn send_rt(topic: &str, sym: &str, id: i64, price: f64, t: DateTime<Utc>, rec_ms: i64) {
+    let payload = trade_json(sym, id, price, t);
+    producer()
+        .send(
+            FutureRecord::to(topic)
+                .key(sym)
+                .partition(0)
+                .timestamp(rec_ms)
+                .payload(payload.as_bytes()),
+            Duration::from_secs(10),
+        )
+        .await
+        .map_err(|e| e.0)
+        .expect("produce");
+}
+
+async fn send_bytes(topic: &str, key: &str, payload: &[u8]) {
+    producer()
+        .send(
+            FutureRecord::to(topic)
+                .key(key)
+                .partition(0)
+                .payload(payload),
+            Duration::from_secs(10),
+        )
+        .await
+        .map_err(|e| e.0)
+        .expect("produce");
+}
+
+/// The skew check now trusts the producer-controlled record timestamp. A single trade whose
+/// `t` AND record timestamp are 50 min ahead is accepted; it pins the global event-time
+/// watermark 50 min ahead, so the next cleanup evicts every other symbol's window and a real
+/// spike on another symbol is never detected. Before the fix, wall clock capped this at 30 s.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn skeptic_future_record_timestamp_does_not_wipe_other_symbols() {
+    let e = Env::new("futrec", 1).await;
+    let now = Utc::now();
+    send(&e.src, 0, "QQQ", 1, 100.0, now - Cd::seconds(60)).await;
+    let fut = now + Cd::minutes(50);
+    send_rt(&e.src, "POIS", 1, 1.0, fut, fut.timestamp_millis()).await;
+    // Ordinary traffic on other symbols so cleanup (every 1024 trades) runs.
+    let p = producer();
+    let mut futs = Vec::new();
+    for i in 0..1100i64 {
+        let ts = now - Cd::seconds(50);
+        let payload = trade_json(&format!("F{}", i % 50), i + 1, 50.0, ts);
+        futs.push(
+            p.send_result(
+                FutureRecord::to(&e.src)
+                    .key("F")
+                    .partition(0)
+                    .timestamp(ts.timestamp_millis())
+                    .payload(&payload),
+            )
+            .map_err(|x| x.0)
+            .unwrap(),
+        );
+    }
+    for f in futs {
+        f.await.unwrap().map_err(|x| x.0).unwrap();
+    }
+    send(&e.src, 0, "QQQ", 2, 110.0, now - Cd::seconds(40)).await;
+    // Same symbol as the poison: real trades now arrive "late" relative to it.
+    send(&e.src, 0, "POIS", 2, 100.0, now - Cd::seconds(39)).await;
+    send(&e.src, 0, "POIS", 3, 110.0, now - Cd::seconds(38)).await;
+    let c = e.spawn(&[]);
+    sleep(8);
+    stop(c);
+    let out = read_out(&e.out, Duration::from_secs(3));
+    e.teardown().await;
+    let syms: Vec<_> = out.iter().map(|x| x.symbol.clone()).collect();
+    assert!(
+        syms.contains(&"QQQ".to_string()) && syms.contains(&"POIS".to_string()),
+        "real spikes lost after one future-dated record: published {syms:?}"
+    );
+}
+
+/// Host-clock skew moved from the detector host to the PRODUCER host: if market-producer's
+/// clock is 90 s behind (same WSL VM in the local setup), its CreateTime is 90 s behind the
+/// Alpaca trade time `t`, every trade is "future", and offsets are still committed.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn skeptic_producer_clock_behind_does_not_lose_spikes() {
+    let e = Env::new("pclk", 1).await;
+    let t = Utc::now();
+    let rec = (t - Cd::seconds(90)).timestamp_millis();
+    send_rt(&e.src, "PCLK", 1, 100.0, t, rec).await;
+    send_rt(&e.src, "PCLK", 2, 110.0, t + Cd::seconds(1), rec + 1000).await;
+    let c = e.spawn(&[]);
+    sleep(8);
+    stop(c);
+    let out = read_out(&e.out, Duration::from_secs(3));
+    let committed = e.committed(0);
+    e.teardown().await;
+    assert!(
+        !out.is_empty() || committed != Some(2),
+        "spike lost: 0 events, committed {committed:?}"
+    );
+}
+
+/// Cooldown seeding trusts whatever is in price-spikes. One bogus event for symbol SEED with
+/// current_timestamp in 2099 (any writer to the topic) suppresses that symbol/direction for
+/// the whole life of the process. Malformed events and other symbols are mixed in.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn skeptic_bogus_seed_event_does_not_suppress_real_spikes() {
+    let e = Env::new("seed", 1).await;
+    let bogus = r#"{"schema_version":1,"event_id":"x","symbol":"SEED","direction":"UP","baseline_price":1.0,"current_price":2.0,"percentage_change":100.0,"window_seconds":600,"baseline_timestamp":"2099-12-31T23:00:00Z","current_timestamp":"2099-12-31T23:59:59Z","detected_at":"2099-12-31T23:59:59Z"}"#;
+    send_bytes(&e.out, "junk", b"not json").await;
+    send_bytes(&e.out, "junk", br#"{"symbol":"SEED"}"#).await;
+    send_bytes(&e.out, "SEED", bogus.as_bytes()).await;
+    send_bytes(&e.out, "OTHR", bogus.replace("SEED", "OTHR").as_bytes()).await;
+    let base = Utc::now() - Cd::seconds(30);
+    send(&e.src, 0, "SEED", 1, 100.0, base).await;
+    send(&e.src, 0, "SEED", 2, 110.0, base + Cd::seconds(1)).await;
+    send(&e.src, 0, "SEED", 3, 95.0, base + Cd::seconds(2)).await;
+    let c = e.spawn(&[]);
+    sleep(8);
+    stop(c);
+    let out: Vec<_> = read_out(&e.out, Duration::from_secs(3))
+        .into_iter()
+        .filter(|x| x.event_id != "x")
+        .map(|x| format!("{}-{}", x.symbol, x.direction.as_str()))
+        .collect();
+    e.teardown().await;
+    assert!(
+        out.contains(&"SEED-UP".to_string()) && out.contains(&"SEED-DOWN".to_string()),
+        "real spikes suppressed by a bogus seed: published {out:?}"
+    );
+}
+
+/// Seeding is capped at 500,000 records but runs AFTER `reset_cooldowns()`. If price-spikes
+/// holds more than the cap inside the lookback (e.g. another writer, or a noisy day), the
+/// real last events are never read, the replay-derived cooldowns are already gone, and the
+/// restart diverges again (finding #4 comes back).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn skeptic_seed_budget_overflow_keeps_cooldown_phase() {
+    let cfg = [
+        ("SPIKE_WINDOW_SECONDS", "60"),
+        ("SPIKE_COOLDOWN_SECONDS", "60"),
+    ];
+    let base = Utc::now() - Cd::seconds(1200);
+    let trade = |i: i64| (100.0 * 1.01f64.powi(i as i32), base + Cd::seconds(i * 10));
+    let r = Env::new("budget-ref", 1).await;
+    for i in 0..100 {
+        let (p, ts) = trade(i);
+        send(&r.src, 0, "TRND", i + 1, p, ts).await;
+    }
+    let c = r.spawn(&cfg);
+    sleep(8);
+    stop(c);
+    let reference: Vec<String> = read_out(&r.out, Duration::from_secs(3))
+        .into_iter()
+        .map(|e| e.event_id)
+        .collect();
+    r.teardown().await;
+
+    let e = Env::new("budget", 1).await;
+    // 520k small junk records into price-spikes first (Kafka time = now, inside the lookback).
+    let p = producer();
+    let mut futs = Vec::new();
+    for _ in 0..520_000 {
+        futs.push(
+            p.send_result(
+                FutureRecord::to(&e.out)
+                    .key("J")
+                    .partition(0)
+                    .payload(b"{}".as_slice()),
+            )
+            .map_err(|x| x.0)
+            .unwrap(),
+        );
+    }
+    for f in futs {
+        f.await.unwrap().map_err(|x| x.0).unwrap();
+    }
+    for i in 0..51 {
+        let (p, ts) = trade(i);
+        send(&e.src, 0, "TRND", i + 1, p, ts).await;
+    }
+    let c = e.spawn(&cfg);
+    sleep(8);
+    assert_eq!(stop(c), Some(0));
+    for i in 51..100 {
+        let (p, ts) = trade(i);
+        send(&e.src, 0, "TRND", i + 1, p, ts).await;
+    }
+    let c = e.spawn(&cfg);
+    sleep(25);
+    stop(c);
+    let got: Vec<String> = read_out(&e.out, Duration::from_secs(15))
+        .into_iter()
+        .filter(|x| !x.event_id.is_empty())
+        .map(|e| e.event_id)
+        .collect();
+    e.teardown().await;
+    assert_eq!(got, reference, "event ids differ after restart");
 }
