@@ -3,14 +3,14 @@
 //! Delivery model (at-least-once): a source offset is stored only after every spike derived
 //! from that record has been acknowledged by the broker (acks=all, idempotent producer).
 use crate::config::Settings;
-use crate::detector::Detector;
-use crate::event::SpikeEvent;
+use crate::detector::{Detector, timestamp_in_range};
+use crate::event::{Direction, SpikeEvent};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use market_events::Trade;
 use rdkafka::{
     Offset, TopicPartitionList,
     config::ClientConfig,
-    consumer::{Consumer, StreamConsumer},
+    consumer::{BaseConsumer, CommitMode, Consumer, StreamConsumer},
     error::{KafkaError, RDKafkaErrorCode},
     message::Message,
     producer::{FutureProducer, FutureRecord, Producer},
@@ -48,12 +48,38 @@ pub enum Parsed {
     Future,
 }
 
+/// Kafka record timestamp as a UTC time; falls back to the wall clock only if the record
+/// carries none. Used as the reference for the future-skew check so the host clock does not
+/// matter and live processing, warm-up and replay agree.
+pub fn record_time<M: Message>(msg: &M) -> DateTime<Utc> {
+    msg.timestamp()
+        .to_millis()
+        .and_then(DateTime::from_timestamp_millis)
+        .unwrap_or_else(Utc::now)
+}
+
+/// Shorten untrusted text for log lines.
+pub fn trunc(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((i, _)) => format!("{}...", &s[..i]),
+        None => s.to_string(),
+    }
+}
+
 pub fn parse_trade(payload: Option<&[u8]>, now: DateTime<Utc>, max_skew_secs: i64) -> Parsed {
     let Some(bytes) = payload else {
         return Parsed::Malformed;
     };
     match serde_json::from_slice::<Trade>(bytes) {
-        Ok(t) if t.timestamp > now + ChronoDuration::seconds(max_skew_secs) => Parsed::Future,
+        // Garbage timestamps (year < 2000 or >= 2100) are malformed, never panic-inducing.
+        Ok(t) if !timestamp_in_range(t.timestamp) => Parsed::Malformed,
+        Ok(t)
+            if now
+                .checked_add_signed(ChronoDuration::seconds(max_skew_secs))
+                .is_some_and(|limit| t.timestamp > limit) =>
+        {
+            Parsed::Future
+        }
         Ok(t) => Parsed::Trade(t),
         Err(_) => Parsed::Malformed,
     }
@@ -126,7 +152,7 @@ pub async fn publish(
                     }
                     let code = e.rdkafka_error_code();
                     if code.is_some_and(non_retriable) {
-                        return Err(PublishFailure::NonRetriable(format!("{e} (event_id={})", event.event_id)));
+                        return Err(PublishFailure::NonRetriable(format!("{e} (event_id={})", trunc(&event.event_id, 80))));
                     }
                     if matches!(code, Some(RDKafkaErrorCode::UnknownTopic | RDKafkaErrorCode::UnknownTopicOrPartition)) {
                         unknown_topic += 1;
@@ -137,7 +163,7 @@ pub async fn publish(
                         unknown_topic = 0;
                     }
                     eprintln!("{} publish failed event_id={} err={e}; retrying in 2s",
-                        chrono::Local::now(), event.event_id);
+                        chrono::Local::now(), trunc(&event.event_id, 80));
                 }
             }
         }
@@ -153,7 +179,10 @@ pub async fn publish(
 
 /// Outcome of startup: either ready to consume or a shutdown signal arrived first.
 pub enum WarmUp {
-    Ready,
+    /// `since_ms`: Kafka timestamp (ms) from which to read `price-spikes` to seed cooldowns.
+    Ready {
+        since_ms: i64,
+    },
     Shutdown,
 }
 
@@ -241,6 +270,10 @@ pub async fn assign_and_warm_up(
     // partition -> committed offset C (exclusive end of the replay range)
     let mut pending: HashMap<i32, i64> = HashMap::new();
     let mut assign = TopicPartitionList::new();
+    // Resolved starts of partitions that had no committed offset; committed below.
+    let mut fresh = TopicPartitionList::new();
+    // Kafka timestamps (ms) of the last committed record per partition.
+    let mut ref_ts: Vec<i64> = Vec::new();
     let lookback_ms = ((s.window_seconds + s.cooldown_seconds + 60) * 1000) as i64;
     for el in committed.elements() {
         let p = el.partition();
@@ -254,6 +287,9 @@ pub async fn assign_and_warm_up(
                 high
             };
             resume.insert(p, start);
+            fresh
+                .add_partition_offset(topic, p, Offset::Offset(start))
+                .map_err(|x| e("assign", x))?;
             assign
                 .add_partition_offset(topic, p, Offset::Offset(start))
                 .map_err(|x| e("assign", x))?;
@@ -261,7 +297,7 @@ pub async fn assign_and_warm_up(
         };
         resume.insert(p, c);
         let warm_start = if c > 0 {
-            warm_start_offset(consumer, topic, p, c, lookback_ms).await
+            warm_start_offset(consumer, topic, p, c, lookback_ms, &mut ref_ts).await
         } else {
             None
         };
@@ -276,8 +312,24 @@ pub async fn assign_and_warm_up(
     }
     consumer.assign(&assign).map_err(|x| e("assign", x))?;
     *next_offsets = resume.clone();
+    // Commit the resolved start of never-committed partitions so `latest` means "from the
+    // first start", not "from every restart" (records produced while down are not skipped).
+    if fresh.count() > 0
+        && let Err(x) = consumer.commit(&fresh, CommitMode::Sync)
+    {
+        eprintln!(
+            "{} WARNING could not commit initial offsets: {x}",
+            chrono::Local::now()
+        );
+    }
+    let since_ms = ref_ts
+        .iter()
+        .min()
+        .copied()
+        .unwrap_or_else(|| Utc::now().timestamp_millis())
+        - lookback_ms;
     if pending.is_empty() {
-        return Ok(WarmUp::Ready);
+        return Ok(WarmUp::Ready { since_ms });
     }
     // Only replayed partitions should deliver records during warm-up.
     let mut idle = TopicPartitionList::new();
@@ -335,11 +387,7 @@ pub async fn assign_and_warm_up(
         };
         if off < c {
             // Use the record's own time as "now" so the future-skew check matches the original run.
-            let reference = msg
-                .timestamp()
-                .to_millis()
-                .and_then(DateTime::from_timestamp_millis)
-                .unwrap_or_else(Utc::now);
+            let reference = record_time(&msg);
             if let Parsed::Trade(t) =
                 parse_trade(msg.payload(), reference, s.max_future_skew_seconds)
             {
@@ -369,7 +417,7 @@ pub async fn assign_and_warm_up(
         detector.symbol_count(),
         detector.retained_trades()
     );
-    Ok(WarmUp::Ready)
+    Ok(WarmUp::Ready { since_ms })
 }
 
 /// Offset to start replaying from for partition `p` whose committed offset is `c`.
@@ -380,6 +428,7 @@ async fn warm_start_offset(
     p: i32,
     c: i64,
     lookback_ms: i64,
+    ref_ts: &mut Vec<i64>,
 ) -> Option<i64> {
     let warn = |why: String| {
         eprintln!(
@@ -411,6 +460,7 @@ async fn warm_start_offset(
         warn("record has no timestamp".into());
         return None;
     };
+    ref_ts.push(ts);
     let mut q = TopicPartitionList::new();
     if let Err(x) = q.add_partition_offset(topic, p, Offset::Offset(ts - lookback_ms)) {
         warn(x.to_string());
@@ -431,5 +481,133 @@ async fn warm_start_offset(
             warn(format!("unexpected offsets_for_times result {other:?}"));
             None
         }
+    }
+}
+
+/// Cooldown entries recovered from already-published events.
+pub type CooldownSeeds = Vec<(String, Direction, DateTime<Utc>)>;
+
+const SEED_BUDGET: Duration = Duration::from_secs(10);
+const SEED_MAX_RECORDS: usize = 500_000;
+
+/// Read the tail of the output topic (records with Kafka timestamp >= `since_ms`, up to the
+/// high watermark at the time of the call) and return, per `(symbol, direction)`, the latest
+/// published event's `current_timestamp`. Never publishes. Bounded by [`SEED_BUDGET`];
+/// on timeout returns what was read with a warning. `Err` means nothing usable was read
+/// (e.g. the topic does not exist) and the caller should keep replay-derived cooldowns.
+pub fn read_cooldown_seeds(s: &Settings, since_ms: i64) -> Result<CooldownSeeds, String> {
+    let topic = s.output_topic.as_str();
+    let consumer: BaseConsumer = ClientConfig::new()
+        .set("bootstrap.servers", &s.brokers)
+        .set("group.id", format!("{}-cooldown-seed", s.group_id))
+        .set("enable.auto.commit", "false")
+        .create()
+        .map_err(|x| format!("seed consumer: {x}"))?;
+    let t5 = Duration::from_secs(5);
+    let meta = consumer
+        .fetch_metadata(Some(topic), t5)
+        .map_err(|x| format!("metadata for {topic}: {x}"))?;
+    let parts: Vec<i32> = meta
+        .topics()
+        .iter()
+        .find(|t| t.name() == topic)
+        .filter(|t| t.error().is_none())
+        .map(|t| t.partitions().iter().map(|p| p.id()).collect())
+        .unwrap_or_default();
+    if parts.is_empty() {
+        return Err(format!("output topic {topic} does not exist yet"));
+    }
+    let mut q = TopicPartitionList::new();
+    for p in &parts {
+        q.add_partition_offset(topic, *p, Offset::Offset(since_ms.max(0)))
+            .map_err(|x| x.to_string())?;
+    }
+    let starts = consumer
+        .offsets_for_times(q, t5)
+        .map_err(|x| format!("offsets_for_times: {x}"))?;
+    let mut assign = TopicPartitionList::new();
+    // partition -> exclusive end offset to read up to
+    let mut ends: HashMap<i32, i64> = HashMap::new();
+    for el in starts.elements() {
+        let p = el.partition();
+        let (low, high) = consumer
+            .fetch_watermarks(topic, p, t5)
+            .map_err(|x| format!("watermarks: {x}"))?;
+        let start = match el.offset() {
+            Offset::Offset(o) => o.max(low),
+            _ => continue, // nothing at or after `since_ms`
+        };
+        if start < high {
+            assign
+                .add_partition_offset(topic, p, Offset::Offset(start))
+                .map_err(|x| x.to_string())?;
+            ends.insert(p, high);
+        }
+    }
+    let mut latest: HashMap<(String, Direction), DateTime<Utc>> = HashMap::new();
+    if !ends.is_empty() {
+        consumer
+            .assign(&assign)
+            .map_err(|x| format!("assign: {x}"))?;
+        let started = Instant::now();
+        let mut read = 0usize;
+        while !ends.is_empty() {
+            if started.elapsed() > SEED_BUDGET || read >= SEED_MAX_RECORDS {
+                eprintln!(
+                    "{} WARNING cooldown seeding hit its budget with {} partition(s) unread; continuing with what was read",
+                    chrono::Local::now(),
+                    ends.len()
+                );
+                break;
+            }
+            match consumer.poll(Duration::from_millis(200)) {
+                Some(Ok(m)) => {
+                    read += 1;
+                    if let Some(Ok(ev)) = m.payload().map(serde_json::from_slice::<SpikeEvent>) {
+                        let slot = latest
+                            .entry((ev.symbol, ev.direction))
+                            .or_insert(ev.current_timestamp);
+                        if ev.current_timestamp > *slot {
+                            *slot = ev.current_timestamp;
+                        }
+                    }
+                    if ends
+                        .get(&m.partition())
+                        .is_some_and(|&h| m.offset() + 1 >= h)
+                    {
+                        ends.remove(&m.partition());
+                    }
+                }
+                Some(Err(x)) => {
+                    eprintln!("{} cooldown seeding read error: {x}", chrono::Local::now())
+                }
+                None => {}
+            }
+        }
+    }
+    Ok(latest.into_iter().map(|((s, d), t)| (s, d, t)).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_trade_bounds_and_skew() {
+        let now = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let js = |t: &str| format!(r#"{{"i":1,"S":"A","p":1.0,"s":1,"t":"{t}"}}"#);
+        let p = |t: &str| parse_trade(Some(js(t).as_bytes()), now, 30);
+        assert!(matches!(p("2023-11-14T22:13:20Z"), Parsed::Trade(_)));
+        assert!(matches!(p("2023-11-14T22:13:51Z"), Parsed::Future));
+        assert!(matches!(p("-262143-01-01T00:00:00Z"), Parsed::Malformed));
+        assert!(matches!(p("1999-12-31T23:59:59Z"), Parsed::Malformed));
+        assert!(matches!(p("+262142-01-01T00:00:00Z"), Parsed::Malformed));
+        assert!(matches!(parse_trade(None, now, 30), Parsed::Malformed));
+    }
+
+    #[test]
+    fn trunc_limits_length() {
+        assert_eq!(trunc("abcdef", 3), "abc...");
+        assert_eq!(trunc("ab", 3), "ab");
     }
 }

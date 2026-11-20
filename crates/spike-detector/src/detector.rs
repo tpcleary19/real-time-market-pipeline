@@ -52,8 +52,21 @@ pub struct Detector {
     stats: Stats,
 }
 
+/// Longest accepted symbol, in bytes. Keeps every event far below Kafka's message size limit.
+pub const MAX_SYMBOL_BYTES: usize = 32;
+
+/// 2000-01-01T00:00:00Z and 2100-01-01T00:00:00Z. Trade times outside this range are treated
+/// as garbage and dropped, which also keeps all chrono arithmetic far from its limits.
+const MIN_TRADE_SECS: i64 = 946_684_800;
+const MAX_TRADE_SECS: i64 = 4_102_444_800;
+
+/// True if `ts` is a plausible trade time (year 2000..2100).
+pub fn timestamp_in_range(ts: DateTime<Utc>) -> bool {
+    (MIN_TRADE_SECS..MAX_TRADE_SECS).contains(&ts.timestamp())
+}
+
 fn valid_symbol(s: &str) -> bool {
-    !s.trim().is_empty() && !s.chars().any(char::is_control)
+    !s.trim().is_empty() && s.len() <= MAX_SYMBOL_BYTES && !s.chars().any(char::is_control)
 }
 
 impl Detector {
@@ -75,7 +88,11 @@ impl Detector {
     /// Feed one trade. Returns 0 or 1 events (up and down cannot both hold against one baseline).
     /// Invalid, duplicate and out-of-order trades are dropped and counted; this never panics.
     pub fn observe(&mut self, trade: &Trade, detected_at: DateTime<Utc>) -> Vec<SpikeEvent> {
-        if !valid_symbol(&trade.symbol) || !trade.price.is_finite() || trade.price <= 0.0 {
+        if !valid_symbol(&trade.symbol)
+            || !trade.price.is_finite()
+            || trade.price <= 0.0
+            || !timestamp_in_range(trade.timestamp)
+        {
             self.stats.invalid += 1;
             return Vec::new();
         }
@@ -156,12 +173,25 @@ impl Detector {
     /// watermark) and expired cooldown entries.
     fn cleanup(&mut self) {
         let Some(wm) = self.watermark else { return };
-        let cutoff = wm - self.window;
+        let cutoff = wm
+            .checked_sub_signed(self.window)
+            .unwrap_or(DateTime::<Utc>::MIN_UTC);
         let before = self.windows.len();
         self.windows
             .retain(|_, w| w.latest().is_some_and(|l| l >= cutoff));
         self.stats.evicted_symbols += (before - self.windows.len()) as u64;
         self.cooldown.prune(wm);
+    }
+
+    /// Forget all cooldown state (used before seeding it from already-published events).
+    pub fn reset_cooldowns(&mut self) {
+        self.cooldown.clear();
+    }
+
+    /// Record that an event for `(symbol, direction)` was already published with the given
+    /// event-time `current_timestamp`, so replay does not emit another one inside the cooldown.
+    pub fn seed_cooldown(&mut self, symbol: &str, direction: Direction, at: DateTime<Utc>) {
+        self.cooldown.seed(symbol, direction, at);
     }
 
     pub fn symbol_count(&self) -> usize {
@@ -242,6 +272,41 @@ mod tests {
         }
         assert_eq!(d.stats().evicted_by_cap, 5);
         assert_eq!(d.retained_trades(), cap as usize);
+    }
+
+    #[test]
+    fn rejects_out_of_range_time_and_long_symbols_without_panic() {
+        let mut d = Detector::new(cfg());
+        for secs in [i64::MIN / 1000, -10_000_000_000, 0, 5_000_000_000] {
+            let mut tr = t("A", 1, 100.0, 0);
+            tr.timestamp = DateTime::from_timestamp(secs.max(-62_135_596_800), 0)
+                .unwrap_or(DateTime::<Utc>::MIN_UTC);
+            assert!(d.observe(&tr, now()).is_empty());
+        }
+        let mut tr = t("A", 2, 100.0, 0);
+        tr.timestamp = DateTime::<Utc>::MIN_UTC;
+        assert!(d.observe(&tr, now()).is_empty());
+        tr.timestamp = DateTime::<Utc>::MAX_UTC;
+        assert!(d.observe(&tr, now()).is_empty());
+        assert!(
+            d.observe(&t(&"X".repeat(MAX_SYMBOL_BYTES + 1), 3, 100.0, 0), now())
+                .is_empty()
+        );
+        assert_eq!(d.stats().invalid, 7);
+        assert_eq!(d.symbol_count(), 0);
+        d.observe(&t(&"x".repeat(MAX_SYMBOL_BYTES), 4, 100.0, 0), now());
+        assert_eq!(d.symbol_count(), 1);
+    }
+
+    #[test]
+    fn seeded_cooldown_suppresses_republish() {
+        let mut d = Detector::new(cfg());
+        d.observe(&t("A", 1, 100.0, 0), now());
+        d.seed_cooldown("A", Direction::Up, t("A", 0, 1.0, 5).timestamp);
+        assert!(d.observe(&t("A", 2, 110.0, 6), now()).is_empty());
+        assert_eq!(d.stats().suppressed_by_cooldown, 1);
+        d.reset_cooldowns();
+        assert_eq!(d.observe(&t("A", 3, 111.0, 7), now()).len(), 1);
     }
 
     #[test]

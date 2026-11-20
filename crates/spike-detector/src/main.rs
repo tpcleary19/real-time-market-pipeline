@@ -10,6 +10,7 @@ use spike_detector::{
     kafka::{self, Parsed, WarmUp},
     metrics::Metrics,
 };
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
@@ -22,9 +23,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(async move {
         wait_for_signal().await;
         let _ = stop_tx.send(true);
+        // A second signal forces an immediate (non-zero) exit. Nothing unsafe is lost:
+        // offsets are only stored after delivery, so the worst case is a replay.
+        wait_for_signal().await;
+        eprintln!("{} second signal: forcing exit", Local::now());
+        std::process::exit(130);
     });
 
-    let consumer = kafka::build_consumer(&settings)?;
+    let consumer = Arc::new(kafka::build_consumer(&settings)?);
     let producer = kafka::build_producer(&settings)?;
     let mut detector = Detector::new(settings.detector_config());
     let mut metrics = Metrics::default();
@@ -38,7 +44,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await
     {
-        Ok(WarmUp::Ready) => {}
+        Ok(WarmUp::Ready { since_ms }) => {
+            // Replace the replay-derived cooldown phase with what was actually published.
+            let s2 = settings.clone();
+            match tokio::task::spawn_blocking(move || kafka::read_cooldown_seeds(&s2, since_ms))
+                .await
+            {
+                Ok(Ok(seeds)) => {
+                    detector.reset_cooldowns();
+                    for (symbol, dir, at) in &seeds {
+                        detector.seed_cooldown(symbol, *dir, *at);
+                    }
+                    eprintln!(
+                        "{} cooldown seeded from {} (symbol,direction) pair(s)",
+                        Local::now(),
+                        seeds.len()
+                    );
+                }
+                Ok(Err(e)) => eprintln!(
+                    "{} WARNING cooldown not seeded from {}: {e}; using replay-derived cooldowns",
+                    Local::now(),
+                    settings.output_topic
+                ),
+                Err(e) => eprintln!("{} WARNING cooldown seeding task failed: {e}", Local::now()),
+            }
+        }
         Ok(WarmUp::Shutdown) => {
             eprintln!("{} shutdown requested during startup", Local::now());
             return Ok(());
@@ -77,7 +107,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let started = Instant::now();
                 metrics.consumed += 1;
                 let now = Utc::now();
-                match kafka::parse_trade(msg.payload(), now, settings.max_future_skew_seconds) {
+                match kafka::parse_trade(
+                    msg.payload(),
+                    kafka::record_time(&msg),
+                    settings.max_future_skew_seconds,
+                ) {
                     Parsed::Trade(trade) => {
                         for event in detector.observe(&trade, now) {
                             eprintln!(
@@ -118,23 +152,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     eprintln!("{} shutting down", Local::now());
-    match consumer.commit_consumer_state(CommitMode::Sync) {
-        Ok(()) => {}
+    // Bounded: a hung broker must not block shutdown. If the commit is lost the records simply replay.
+    let c2 = Arc::clone(&consumer);
+    let commit = tokio::task::spawn_blocking(move || c2.commit_consumer_state(CommitMode::Sync));
+    match tokio::time::timeout(Duration::from_secs(10), commit).await {
+        Ok(Ok(Ok(()))) => {}
         // Nothing stored since the last commit: not an error.
-        Err(e) if e.rdkafka_error_code() == Some(rdkafka::error::RDKafkaErrorCode::NoOffset) => {}
-        Err(e) => eprintln!("{} final commit: {e}", Local::now()),
+        Ok(Ok(Err(e)))
+            if e.rdkafka_error_code() == Some(rdkafka::error::RDKafkaErrorCode::NoOffset) => {}
+        Ok(Ok(Err(e))) => eprintln!("{} final commit: {e}", Local::now()),
+        Ok(Err(e)) => eprintln!("{} final commit task failed: {e}", Local::now()),
+        Err(_) => eprintln!(
+            "{} WARNING final commit timed out after 10s; exiting (records will replay)",
+            Local::now()
+        ),
     }
-    let _ = producer.flush(Duration::from_secs(10));
+    let _ = tokio::task::block_in_place(|| producer.flush(Duration::from_secs(5)));
     metrics.report(
         &detector.stats(),
         detector.symbol_count(),
         detector.retained_trades(),
         None,
     );
-    if failed {
-        std::process::exit(1);
-    }
-    Ok(())
+    // Explicit exit: a timed-out blocking commit must not keep the runtime alive.
+    std::process::exit(if failed { 1 } else { 0 });
 }
 
 fn consumer_lag(

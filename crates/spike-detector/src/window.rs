@@ -74,7 +74,9 @@ impl SymbolWindow {
 
     /// Remove trades with `ts < now - window`.
     pub fn expire(&mut self, now: DateTime<Utc>, window: Duration) {
-        let cutoff = now - window;
+        let cutoff = now
+            .checked_sub_signed(window)
+            .unwrap_or(DateTime::<Utc>::MIN_UTC);
         while self.entries.front().is_some_and(|(e, _)| e.ts < cutoff) {
             self.pop_front();
         }

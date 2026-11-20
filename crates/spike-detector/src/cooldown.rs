@@ -21,7 +21,9 @@ impl Cooldown {
     /// cooldown. Suppressed while `now < last_published + duration`.
     pub fn try_fire(&mut self, symbol: &str, dir: Direction, now: DateTime<Utc>) -> bool {
         if let Some(&prev) = self.last.get(&(symbol.to_string(), dir))
-            && now < prev + self.duration
+            && prev
+                .checked_add_signed(self.duration)
+                .is_none_or(|end| now < end)
         {
             return false;
         }
@@ -32,7 +34,22 @@ impl Cooldown {
     /// Drop entries whose cooldown has ended relative to the global event-time watermark.
     pub fn prune(&mut self, watermark: DateTime<Utc>) {
         let d = self.duration;
-        self.last.retain(|_, &mut t| watermark < t + d);
+        self.last
+            .retain(|_, &mut t| t.checked_add_signed(d).is_none_or(|end| watermark < end));
+    }
+
+    /// Record that an event for `(symbol, dir)` was already published at event time `at`
+    /// (keeps the later of the existing and given time).
+    pub fn seed(&mut self, symbol: &str, dir: Direction, at: DateTime<Utc>) {
+        let e = self.last.entry((symbol.to_string(), dir)).or_insert(at);
+        if at > *e {
+            *e = at;
+        }
+    }
+
+    /// Forget all cooldown state.
+    pub fn clear(&mut self) {
+        self.last.clear();
     }
 
     pub fn len(&self) -> usize {
