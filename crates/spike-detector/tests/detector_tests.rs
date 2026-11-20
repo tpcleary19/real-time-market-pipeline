@@ -171,20 +171,78 @@ fn new_symbol_at_cap_is_rejected_without_eviction() {
     assert_eq!(feed(&mut d, &trade("A", 2, 110.0, 4)).len(), 1);
 }
 
+/// Idleness is PROCESSING time (`detected_at`), measured from the last accepted trade.
+fn dp(secs: i64) -> chrono::DateTime<chrono::Utc> {
+    detected() + chrono::Duration::seconds(secs)
+}
+
 #[test]
 fn idle_symbols_are_cleaned_up_and_free_capacity() {
     let mut d = Detector::new(Config {
         max_symbols: 2,
         ..cfg()
     });
-    feed(&mut d, &trade("A", 1, 100.0, 0));
-    feed(&mut d, &trade("B", 1, 100.0, 1));
-    // B stays active; A idle for > window.
-    feed(&mut d, &trade("B", 2, 100.0, 700));
-    feed(&mut d, &trade("C", 1, 100.0, 701));
+    d.observe(&trade("A", 1, 100.0, 0), dp(0));
+    d.observe(&trade("B", 1, 100.0, 1), dp(1));
+    // B stays active in processing time; A has been idle for more than the window.
+    d.observe(&trade("B", 2, 100.0, 700), dp(700));
+    // C arrives at capacity: cleanup evicts idle A, freeing the slot.
+    d.observe(&trade("C", 1, 100.0, 701), dp(701));
     assert!(d.symbol_count() <= 2);
-    // C must have been admitted: a spike on it is detected.
-    assert_eq!(feed(&mut d, &trade("C", 2, 110.0, 702)).len(), 1);
+    assert_eq!(
+        d.observe(&trade("C", 2, 110.0, 702), dp(702)).len(),
+        1,
+        "C must have been admitted"
+    );
+}
+
+#[test]
+fn symbol_is_not_idle_within_window_of_processing_time() {
+    let mut d = Detector::new(Config {
+        max_symbols: 2,
+        ..cfg()
+    });
+    d.observe(&trade("A", 1, 100.0, 0), dp(0));
+    d.observe(&trade("B", 1, 100.0, 1), dp(1));
+    // Event time races ahead, but only 100s of processing time passed: A is not idle.
+    d.observe(&trade("B", 2, 100.0, 700), dp(100));
+    d.observe(&trade("C", 1, 100.0, 701), dp(101));
+    assert_eq!(d.symbol_count(), 2, "A and B retained, C rejected at cap");
+    assert!(d.observe(&trade("C", 2, 120.0, 702), dp(102)).is_empty());
+}
+
+#[test]
+fn future_poisoned_symbol_recovers_after_a_window_of_processing_time() {
+    let mut d = det();
+    let filler = |d: &mut Detector, base_id: i64, at_dp: i64| {
+        for i in 0..1100i64 {
+            d.observe(
+                &trade(&format!("F{}", i % 50), base_id + i, 50.0, 1),
+                dp(at_dp),
+            );
+        }
+    };
+    d.observe(&trade("OK", 1, 100.0, 0), dp(0));
+    d.observe(&trade("POIS", 1, 100.0, 0), dp(0));
+    // Far-future event time pins POIS's latest timestamp ~28h ahead.
+    d.observe(&trade("POIS", 2, 100.0, 100_000), dp(1));
+    filler(&mut d, 1, 2); // >1024 observations: cleanup passes run
+    // OK is isolated: its spike is still detected.
+    assert_eq!(d.observe(&trade("OK", 2, 110.0, 5), dp(3)).len(), 1);
+    // Real POIS trades are now late and dropped, even with a huge move.
+    assert!(d.observe(&trade("POIS", 3, 200.0, 10), dp(4)).is_empty());
+    // Only 100s of processing time later POIS is still pinned (late trades do not refresh it).
+    filler(&mut d, 5000, 100);
+    assert!(d.observe(&trade("POIS", 4, 200.0, 11), dp(100)).is_empty());
+    // OK keeps working throughout: DOWN vs its in-window baseline.
+    assert_eq!(d.observe(&trade("OK", 3, 89.0, 400), dp(300)).len(), 1);
+    // A full window (+1s) of processing time after POIS's last ACCEPTED trade (dp 1):
+    filler(&mut d, 9000, 602);
+    assert!(d.observe(&trade("POIS", 5, 100.0, 20), dp(602)).is_empty()); // fresh baseline
+    let ev = d.observe(&trade("POIS", 6, 110.0, 21), dp(602));
+    assert_eq!(ev.len(), 1, "POIS recovered after eviction");
+    assert_eq!(ev[0].baseline_price, 100.0);
+    assert_eq!(ev[0].baseline_timestamp, at(20));
 }
 
 // 8
