@@ -288,12 +288,12 @@ fn skeptic_symbol_byte_bounds_and_odd_chars() {
     let cases = [
         "X".repeat(32),        // 32 bytes: ok
         "X".repeat(33),        // 33: reject
-        "€".repeat(10) + "XX", // 32 bytes, 12 chars: ok
-        "€".repeat(11),        // 33 bytes, 11 chars: reject
+        "€".repeat(10) + "XX", // non-ASCII: reject (symbols are ASCII graphic only)
+        "€".repeat(11),        // 33 bytes: reject
         "AAPL\u{0007}".into(), // control: reject
-        "AAPL\u{200B}".into(), // zero-width space: NOT control -> accepted
-        " AAPL".into(),        // leading space: accepted
-        "AAPL\u{202E}".into(), // RTL override (Cf): accepted
+        "AAPL\u{200B}".into(), // zero-width space: reject
+        " AAPL".into(),        // leading space: reject
+        "AAPL\u{202E}".into(), // RTL override: reject
     ];
     for (i, s) in cases.iter().enumerate() {
         let mut d = Detector::new(cfg(600, 600));
@@ -302,7 +302,8 @@ fn skeptic_symbol_byte_bounds_and_odd_chars() {
             accepted.push(i);
         }
     }
-    assert_eq!(accepted, vec![0, 2, 5, 6, 7]);
+    // Only the 32-byte ASCII-graphic symbol is valid.
+    assert_eq!(accepted, vec![0]);
 }
 
 #[test]
