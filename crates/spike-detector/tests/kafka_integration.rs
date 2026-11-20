@@ -22,6 +22,32 @@ fn brokers() -> String {
     std::env::var("SPIKE_IT_BROKERS").unwrap_or_else(|_| "localhost:19092".into())
 }
 
+static BROKER_WARM: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+
+/// A cold broker creates __consumer_offsets lazily on first group use, which can take long
+/// enough to time out the first test. Force it once before any test body runs.
+async fn warm_broker() {
+    BROKER_WARM
+        .get_or_init(|| async {
+            let c: BaseConsumer = ClientConfig::new()
+                .set("bootstrap.servers", brokers())
+                .set("group.id", "it-broker-warmup")
+                .create()
+                .unwrap();
+            let start = Instant::now();
+            loop {
+                let mut l = TopicPartitionList::new();
+                l.add_partition("it-warmup-nonexistent", 0);
+                if c.committed_offsets(l, Duration::from_secs(10)).is_ok()
+                    || start.elapsed() > Duration::from_secs(120)
+                {
+                    break;
+                }
+            }
+        })
+        .await;
+}
+
 static N: AtomicU32 = AtomicU32::new(0);
 
 struct Env {
@@ -35,6 +61,7 @@ impl Env {
         Self::with_partitions(tag, 1).await
     }
     async fn with_partitions(tag: &str, parts: i32) -> Env {
+        warm_broker().await;
         let id = format!(
             "{tag}-{}-{}-{}",
             std::process::id(),
@@ -420,10 +447,12 @@ async fn partition_without_committed_offset_is_still_processed_after_restart() {
     assert_eq!(first.len(), 1);
     stop(child);
     assert_eq!(e.committed_p(0), Some(50_001));
+    // The service commits the resolved start of never-committed partitions at startup. p1 was
+    // empty, so its start is offset 0: committed == start means no p1 record has been handled.
     assert_eq!(
         e.committed_p(1),
-        None,
-        "precondition: p1 has no committed offset"
+        Some(0),
+        "precondition: p1 committed at its resolved start (0), nothing handled yet"
     );
     // While down: p1 gets its first records. Spike is EARLY in the backlog, then filler.
     send_trade_p(&e.src, 1, "ZZZ", 1, 50.0, 50).await;

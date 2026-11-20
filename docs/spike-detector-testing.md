@@ -21,3 +21,5 @@ Broker (separate from the compose one, to avoid the fixed `market-kafka` contain
 Run (about 2 min; `SPIKE_IT_LOG=1` shows the service's stderr):
     SPIKE_IT_BROKERS=localhost:19092 cargo test -p spike-detector --test kafka_integration -- --ignored --test-threads=1
 Cleanup: `docker rm -f spikeit-kafka`.
+
+Note: at startup the service commits the resolved start offset for partitions that never had a committed offset, so the two-partition test expects p1's committed offset to be its start (0) after run 1, then its end offset (3002) after the restart. Keep `--test-threads=1`: parallel runs against a cold broker are flaky.
