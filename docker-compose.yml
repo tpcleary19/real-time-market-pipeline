@@ -49,6 +49,23 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
 
+  # One-shot: ensures the price-spikes topic exists (shares kafka's network so localhost:9092 works).
+  kafka-init:
+    image: apache/kafka:4.1.0
+    container_name: market-kafka-init
+    network_mode: "service:kafka"
+    depends_on:
+      - kafka
+    restart: "no"
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        for i in $$(seq 1 30); do
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --if-not-exists --topic price-spikes --partitions 1 --replication-factor 1 && exit 0
+          sleep 2
+        done
+        exit 1
+
 volumes:
   postgres-data:
   redis-data:
