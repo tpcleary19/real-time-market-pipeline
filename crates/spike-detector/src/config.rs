@@ -49,7 +49,7 @@ impl Settings {
             max_symbols: parse(get, "SPIKE_MAX_SYMBOLS", 10_000)?,
             metrics_interval_seconds: parse(get, "SPIKE_METRICS_INTERVAL_SECONDS", 30)?,
             auto_offset_reset: get("SPIKE_AUTO_OFFSET_RESET").unwrap_or_else(|| "latest".into()),
-            max_future_skew_seconds: parse(get, "SPIKE_MAX_FUTURE_SKEW_SECONDS", 30)?,
+            max_future_skew_seconds: parse(get, "SPIKE_MAX_FUTURE_SKEW_SECONDS", 300)?,
         };
         s.validate()?;
         Ok(s)
@@ -107,7 +107,7 @@ mod tests {
     #[test]
     fn skew_default_and_range() {
         let s = Settings::from_lookup(&|_| None).unwrap();
-        assert_eq!(s.max_future_skew_seconds, 30);
+        assert_eq!(s.max_future_skew_seconds, 300);
         for bad in ["-1", "3601", "9223372036854775807", "abc"] {
             let r = Settings::from_lookup(&|k| {
                 (k == "SPIKE_MAX_FUTURE_SKEW_SECONDS").then(|| bad.to_string())

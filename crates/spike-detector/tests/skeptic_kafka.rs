@@ -187,9 +187,10 @@ fn read_out(topic: &str, settle: Duration) -> Vec<SpikeEvent> {
     let start = Instant::now();
     while start.elapsed() < settle {
         if let Some(Ok(m)) = c.poll(Duration::from_millis(200))
-            && let Some(Ok(ev)) = m.payload().map(serde_json::from_slice) {
-                got.push(ev);
-            }
+            && let Some(Ok(ev)) = m.payload().map(serde_json::from_slice)
+        {
+            got.push(ev);
+        }
     }
     got
 }

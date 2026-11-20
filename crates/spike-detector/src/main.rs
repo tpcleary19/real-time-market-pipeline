@@ -45,20 +45,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await
     {
         Ok(WarmUp::Ready { since_ms }) => {
-            // Replace the replay-derived cooldown phase with what was actually published.
             let s2 = settings.clone();
             match tokio::task::spawn_blocking(move || kafka::read_cooldown_seeds(&s2, since_ms))
                 .await
             {
-                Ok(Ok(seeds)) => {
-                    detector.reset_cooldowns();
-                    for (symbol, dir, at) in &seeds {
-                        detector.seed_cooldown(symbol, *dir, *at);
+                Ok(Ok(read)) => {
+                    // Seeds from the future (bogus or foreign events) would suppress real
+                    // spikes: ignore anything beyond the replay's newest event time + skew.
+                    let reference = detector.max_event_time().unwrap_or_else(Utc::now);
+                    let (kept, ignored) = kafka::filter_seeds(
+                        read.seeds,
+                        reference,
+                        settings.max_future_skew_seconds,
+                    );
+                    for (sym, dir, at) in &ignored {
+                        eprintln!(
+                            "{} WARNING ignoring cooldown seed {} {} at {at}: later than replay time {reference} + {}s",
+                            Local::now(),
+                            kafka::trunc(sym, 40),
+                            dir.as_str(),
+                            settings.max_future_skew_seconds
+                        );
+                    }
+                    if read.complete {
+                        // Exact record of what was published: authoritative.
+                        detector.reset_cooldowns();
+                    }
+                    for (symbol, dir, at) in &kept {
+                        if read.reached_end {
+                            // Newest published event of this pair: exact, beats the replay phase.
+                            detector.override_cooldown(symbol, *dir, *at);
+                        } else {
+                            // Budget hit before the end: the newest events may be unread.
+                            detector.seed_cooldown(symbol, *dir, *at);
+                        }
                     }
                     eprintln!(
-                        "{} cooldown seeded from {} (symbol,direction) pair(s)",
+                        "{} cooldown seeded: {} pair(s) used, {} ignored (future), {} foreign-schema events skipped, mode={}",
                         Local::now(),
-                        seeds.len()
+                        kept.len(),
+                        ignored.len(),
+                        read.foreign_schema,
+                        if read.complete {
+                            "authoritative"
+                        } else if read.reached_end {
+                            "per-pair override, others keep replay-derived (older records skipped)"
+                        } else {
+                            "max-merge with replay-derived (budget hit before the end)"
+                        }
                     );
                 }
                 Ok(Err(e)) => eprintln!(
@@ -88,6 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tick.tick().await;
 
     let mut failed = false;
+    let mut future_warn = spike_detector::metrics::FutureWarn::default();
     'main: loop {
         tokio::select! {
             _ = stop_rx.changed() => break,
@@ -109,7 +144,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let now = Utc::now();
                 match kafka::parse_trade(
                     msg.payload(),
-                    kafka::record_time(&msg),
+                    now,
                     settings.max_future_skew_seconds,
                 ) {
                     Parsed::Trade(trade) => {
@@ -138,7 +173,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     Parsed::Future => {
                         metrics.rejected_future += 1;
-                        eprintln!("{} Future-dated trade rejected partition={} offset={}", Local::now(), msg.partition(), msg.offset());
+                        let drift = msg
+                            .payload()
+                            .and_then(|p| serde_json::from_slice::<market_events::Trade>(p).ok())
+                            .map(|t| (t.timestamp - now).num_seconds());
+                        future_warn.record(
+                            drift,
+                            settings.max_future_skew_seconds,
+                            msg.partition(),
+                            msg.offset(),
+                        );
                     }
                 }
                 // Only now is the record fully handled (any spikes are acknowledged).

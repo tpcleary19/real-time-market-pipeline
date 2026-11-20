@@ -27,6 +27,8 @@ pub enum Admit {
 #[derive(Debug, Default)]
 pub struct SymbolWindow {
     cap: Option<usize>,
+    /// Processing time (injected clock) of the last ACCEPTED trade.
+    last_activity: Option<DateTime<Utc>>,
     cap_evictions: u64,
     entries: VecDeque<(Entry, TradeKey)>,
     ids: HashSet<TradeKey>,
@@ -40,6 +42,14 @@ impl SymbolWindow {
             cap: Some(cap),
             ..Self::default()
         }
+    }
+
+    pub fn touch(&mut self, at: DateTime<Utc>) {
+        self.last_activity = Some(at);
+    }
+
+    pub fn last_activity(&self) -> Option<DateTime<Utc>> {
+        self.last_activity
     }
 
     /// Number of trades discarded early by the cap since the last call.

@@ -62,3 +62,39 @@ impl Metrics {
         self.latency_max = Duration::ZERO;
     }
 }
+
+/// Rate-limited (at most one line per 30 s) warning for trades rejected as future-dated, so a
+/// drifting host clock (e.g. WSL2 after sleep) is loud instead of silently dropping the feed.
+#[derive(Default)]
+pub struct FutureWarn {
+    last: Option<std::time::Instant>,
+    since_last: u64,
+    max_drift: i64,
+}
+
+impl FutureWarn {
+    const INTERVAL: Duration = Duration::from_secs(30);
+
+    pub fn record(
+        &mut self,
+        drift_secs: Option<i64>,
+        limit_secs: i64,
+        partition: i32,
+        offset: i64,
+    ) {
+        self.since_last += 1;
+        self.max_drift = self.max_drift.max(drift_secs.unwrap_or(0));
+        let due = self.last.is_none_or(|l| l.elapsed() >= Self::INTERVAL);
+        if due {
+            eprintln!(
+                "{} WARNING {} trade(s) rejected as future-dated since the last warning (limit {limit_secs}s ahead of this host's clock, max drift seen {}s, latest at partition={partition} offset={offset}). If this host's clock is behind the feed, the feed is being dropped: fix the clock or raise SPIKE_MAX_FUTURE_SKEW_SECONDS.",
+                Local::now(),
+                self.since_last,
+                self.max_drift
+            );
+            self.last = Some(std::time::Instant::now());
+            self.since_last = 0;
+            self.max_drift = 0;
+        }
+    }
+}

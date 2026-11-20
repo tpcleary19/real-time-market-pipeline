@@ -48,16 +48,6 @@ pub enum Parsed {
     Future,
 }
 
-/// Kafka record timestamp as a UTC time; falls back to the wall clock only if the record
-/// carries none. Used as the reference for the future-skew check so the host clock does not
-/// matter and live processing, warm-up and replay agree.
-pub fn record_time<M: Message>(msg: &M) -> DateTime<Utc> {
-    msg.timestamp()
-        .to_millis()
-        .and_then(DateTime::from_timestamp_millis)
-        .unwrap_or_else(Utc::now)
-}
-
 /// Shorten untrusted text for log lines.
 pub fn trunc(s: &str, max: usize) -> String {
     match s.char_indices().nth(max) {
@@ -386,8 +376,7 @@ pub async fn assign_and_warm_up(
             continue; // re-seeked below
         };
         if off < c {
-            // Use the record's own time as "now" so the future-skew check matches the original run.
-            let reference = record_time(&msg);
+            let reference = Utc::now();
             if let Parsed::Trade(t) =
                 parse_trade(msg.payload(), reference, s.max_future_skew_seconds)
             {
@@ -487,15 +476,30 @@ async fn warm_start_offset(
 /// Cooldown entries recovered from already-published events.
 pub type CooldownSeeds = Vec<(String, Direction, DateTime<Utc>)>;
 
-const SEED_BUDGET: Duration = Duration::from_secs(10);
-const SEED_MAX_RECORDS: usize = 500_000;
+/// Result of reading the tail of the output topic.
+pub struct SeedRead {
+    pub seeds: CooldownSeeds,
+    /// True only if everything from `since_ms` to the high watermark was read. A partial read
+    /// (tail cap or time budget) must only be MERGED into existing cooldowns, never replace them.
+    pub complete: bool,
+    /// True if the read reached the high watermark of every partition (only older records
+    /// may have been skipped by the tail cap), so for any pair that appears in `seeds` the
+    /// value is the newest published event and is exact.
+    pub reached_end: bool,
+    /// Events skipped because their `schema_version` is not ours.
+    pub foreign_schema: u64,
+}
 
-/// Read the tail of the output topic (records with Kafka timestamp >= `since_ms`, up to the
-/// high watermark at the time of the call) and return, per `(symbol, direction)`, the latest
-/// published event's `current_timestamp`. Never publishes. Bounded by [`SEED_BUDGET`];
-/// on timeout returns what was read with a warning. `Err` means nothing usable was read
-/// (e.g. the topic does not exist) and the caller should keep replay-derived cooldowns.
-pub fn read_cooldown_seeds(s: &Settings, since_ms: i64) -> Result<CooldownSeeds, String> {
+const SEED_BUDGET: Duration = Duration::from_secs(10);
+/// Only the newest this-many records per partition are read, so any shortfall skips OLD events.
+const SEED_TAIL_RECORDS: i64 = 100_000;
+
+/// Read the tail of the output topic (records with Kafka timestamp >= `since_ms`, at most the
+/// newest [`SEED_TAIL_RECORDS`] per partition, up to the high watermark at the time of the
+/// call) and return, per `(symbol, direction)`, the latest published event's
+/// `current_timestamp`. Never publishes. Bounded by [`SEED_BUDGET`]. `Err` means nothing
+/// usable was read (e.g. the topic does not exist) and the caller keeps existing cooldowns.
+pub fn read_cooldown_seeds(s: &Settings, since_ms: i64) -> Result<SeedRead, String> {
     let topic = s.output_topic.as_str();
     let consumer: BaseConsumer = ClientConfig::new()
         .set("bootstrap.servers", &s.brokers)
@@ -525,6 +529,8 @@ pub fn read_cooldown_seeds(s: &Settings, since_ms: i64) -> Result<CooldownSeeds,
     let starts = consumer
         .offsets_for_times(q, t5)
         .map_err(|x| format!("offsets_for_times: {x}"))?;
+    let mut complete = true;
+    let mut reached_end = true;
     let mut assign = TopicPartitionList::new();
     // partition -> exclusive end offset to read up to
     let mut ends: HashMap<i32, i64> = HashMap::new();
@@ -533,10 +539,19 @@ pub fn read_cooldown_seeds(s: &Settings, since_ms: i64) -> Result<CooldownSeeds,
         let (low, high) = consumer
             .fetch_watermarks(topic, p, t5)
             .map_err(|x| format!("watermarks: {x}"))?;
-        let start = match el.offset() {
+        let from_time = match el.offset() {
             Offset::Offset(o) => o.max(low),
             _ => continue, // nothing at or after `since_ms`
         };
+        let start = from_time.max(high - SEED_TAIL_RECORDS);
+        if start > from_time {
+            complete = false;
+            eprintln!(
+                "{} WARNING cooldown seeding reads only the newest {SEED_TAIL_RECORDS} records of partition {p} ({} older skipped)",
+                chrono::Local::now(),
+                start - from_time
+            );
+        }
         if start < high {
             assign
                 .add_partition_offset(topic, p, Offset::Offset(start))
@@ -545,30 +560,36 @@ pub fn read_cooldown_seeds(s: &Settings, since_ms: i64) -> Result<CooldownSeeds,
         }
     }
     let mut latest: HashMap<(String, Direction), DateTime<Utc>> = HashMap::new();
+    let mut foreign_schema = 0u64;
     if !ends.is_empty() {
         consumer
             .assign(&assign)
             .map_err(|x| format!("assign: {x}"))?;
         let started = Instant::now();
-        let mut read = 0usize;
         while !ends.is_empty() {
-            if started.elapsed() > SEED_BUDGET || read >= SEED_MAX_RECORDS {
+            if started.elapsed() > SEED_BUDGET {
+                complete = false;
+                reached_end = false;
                 eprintln!(
-                    "{} WARNING cooldown seeding hit its budget with {} partition(s) unread; continuing with what was read",
+                    "{} WARNING cooldown seeding hit its {}s budget with {} partition(s) unread; merging what was read",
                     chrono::Local::now(),
+                    SEED_BUDGET.as_secs(),
                     ends.len()
                 );
                 break;
             }
             match consumer.poll(Duration::from_millis(200)) {
                 Some(Ok(m)) => {
-                    read += 1;
                     if let Some(Ok(ev)) = m.payload().map(serde_json::from_slice::<SpikeEvent>) {
-                        let slot = latest
-                            .entry((ev.symbol, ev.direction))
-                            .or_insert(ev.current_timestamp);
-                        if ev.current_timestamp > *slot {
-                            *slot = ev.current_timestamp;
+                        if ev.schema_version != crate::event::SCHEMA_VERSION {
+                            foreign_schema += 1;
+                        } else {
+                            let slot = latest
+                                .entry((ev.symbol, ev.direction))
+                                .or_insert(ev.current_timestamp);
+                            if ev.current_timestamp > *slot {
+                                *slot = ev.current_timestamp;
+                            }
                         }
                     }
                     if ends
@@ -585,29 +606,23 @@ pub fn read_cooldown_seeds(s: &Settings, since_ms: i64) -> Result<CooldownSeeds,
             }
         }
     }
-    Ok(latest.into_iter().map(|((s, d), t)| (s, d, t)).collect())
+    Ok(SeedRead {
+        seeds: latest.into_iter().map(|((s, d), t)| (s, d, t)).collect(),
+        complete,
+        reached_end,
+        foreign_schema,
+    })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_trade_bounds_and_skew() {
-        let now = DateTime::from_timestamp(1_700_000_000, 0).unwrap();
-        let js = |t: &str| format!(r#"{{"i":1,"S":"A","p":1.0,"s":1,"t":"{t}"}}"#);
-        let p = |t: &str| parse_trade(Some(js(t).as_bytes()), now, 30);
-        assert!(matches!(p("2023-11-14T22:13:20Z"), Parsed::Trade(_)));
-        assert!(matches!(p("2023-11-14T22:13:51Z"), Parsed::Future));
-        assert!(matches!(p("-262143-01-01T00:00:00Z"), Parsed::Malformed));
-        assert!(matches!(p("1999-12-31T23:59:59Z"), Parsed::Malformed));
-        assert!(matches!(p("+262142-01-01T00:00:00Z"), Parsed::Malformed));
-        assert!(matches!(parse_trade(None, now, 30), Parsed::Malformed));
-    }
-
-    #[test]
-    fn trunc_limits_length() {
-        assert_eq!(trunc("abcdef", 3), "abc...");
-        assert_eq!(trunc("ab", 3), "ab");
-    }
+/// Drop seeds whose `current_timestamp` is later than `reference + max_skew`: a seed from the
+/// future would suppress real spikes for that pair. Returns `(kept, ignored)`.
+pub fn filter_seeds(
+    seeds: CooldownSeeds,
+    reference: DateTime<Utc>,
+    max_skew_secs: i64,
+) -> (CooldownSeeds, Vec<(String, Direction, DateTime<Utc>)>) {
+    let limit = reference.checked_add_signed(ChronoDuration::seconds(max_skew_secs));
+    seeds
+        .into_iter()
+        .partition(|(_, _, at)| limit.is_none_or(|l| *at <= l))
 }

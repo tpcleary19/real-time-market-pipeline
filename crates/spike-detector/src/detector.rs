@@ -46,8 +46,9 @@ pub struct Detector {
     window: Duration,
     windows: HashMap<String, SymbolWindow>,
     cooldown: Cooldown,
-    /// Highest event time accepted for any symbol; drives idle cleanup.
-    watermark: Option<DateTime<Utc>>,
+    /// Latest injected processing time (`detected_at`); drives idle-symbol cleanup, so one
+    /// symbol's event times can never affect another symbol's state.
+    proc_now: Option<DateTime<Utc>>,
     observed: u64,
     stats: Stats,
 }
@@ -65,8 +66,10 @@ pub fn timestamp_in_range(ts: DateTime<Utc>) -> bool {
     (MIN_TRADE_SECS..MAX_TRADE_SECS).contains(&ts.timestamp())
 }
 
+/// 1..=32 bytes, ASCII graphic characters only (0x21..=0x7E). Rejects spaces, control and
+/// all non-ASCII characters (zero-width, RTL, lookalikes). Lowercase and `.`/`-`/`/` are fine.
 fn valid_symbol(s: &str) -> bool {
-    !s.trim().is_empty() && s.len() <= MAX_SYMBOL_BYTES && !s.chars().any(char::is_control)
+    !s.is_empty() && s.len() <= MAX_SYMBOL_BYTES && s.bytes().all(|b| (0x21..=0x7E).contains(&b))
 }
 
 impl Detector {
@@ -79,7 +82,7 @@ impl Detector {
             window,
             windows: HashMap::new(),
             cooldown: Cooldown::new(cooldown),
-            watermark: None,
+            proc_now: None,
             observed: 0,
             stats: Stats::default(),
         }
@@ -97,6 +100,8 @@ impl Detector {
             return Vec::new();
         }
         self.observed += 1;
+        let proc_now = self.proc_now.map_or(detected_at, |p| p.max(detected_at));
+        self.proc_now = Some(proc_now);
         if self.observed.is_multiple_of(CLEANUP_EVERY) {
             self.cleanup();
         }
@@ -129,10 +134,7 @@ impl Detector {
         }
         self.stats.trades_accepted += 1;
         self.stats.evicted_by_cap += win.take_cap_evictions();
-        self.watermark = Some(
-            self.watermark
-                .map_or(trade.timestamp, |w| w.max(trade.timestamp)),
-        );
+        win.touch(proc_now);
 
         let Some(base) = win.baseline() else {
             return Vec::new();
@@ -149,7 +151,7 @@ impl Detector {
         self.stats.spikes_detected += 1;
         if !self
             .cooldown
-            .try_fire(&trade.symbol, direction, trade.timestamp)
+            .try_fire(&trade.symbol, direction, trade.timestamp, proc_now)
         {
             self.stats.suppressed_by_cooldown += 1;
             return Vec::new();
@@ -169,18 +171,26 @@ impl Detector {
         }]
     }
 
-    /// Drop symbols with no trade inside the window (relative to the global event-time
-    /// watermark) and expired cooldown entries.
+    /// Drop symbols with no ACCEPTED trade for more than `window` of processing time, then
+    /// prune finished cooldowns per symbol. Event times of other symbols play no role, so a
+    /// symbol poisoned by a future-dated trade recovers on its own.
     fn cleanup(&mut self) {
-        let Some(wm) = self.watermark else { return };
-        let cutoff = wm
+        let Some(now) = self.proc_now else { return };
+        let cutoff = now
             .checked_sub_signed(self.window)
             .unwrap_or(DateTime::<Utc>::MIN_UTC);
         let before = self.windows.len();
         self.windows
-            .retain(|_, w| w.latest().is_some_and(|l| l >= cutoff));
+            .retain(|_, w| w.last_activity().is_some_and(|a| a >= cutoff));
         self.stats.evicted_symbols += (before - self.windows.len()) as u64;
-        self.cooldown.prune(wm);
+        let windows = &self.windows;
+        self.cooldown
+            .prune(now, &|s| windows.get(s).and_then(|w| w.latest()));
+    }
+
+    /// Highest event time of any retained symbol (reference for sanity-checking seeds).
+    pub fn max_event_time(&self) -> Option<DateTime<Utc>> {
+        self.windows.values().filter_map(|w| w.latest()).max()
     }
 
     /// Forget all cooldown state (used before seeding it from already-published events).
@@ -192,6 +202,12 @@ impl Detector {
     /// event-time `current_timestamp`, so replay does not emit another one inside the cooldown.
     pub fn seed_cooldown(&mut self, symbol: &str, direction: Direction, at: DateTime<Utc>) {
         self.cooldown.seed(symbol, direction, at);
+    }
+
+    /// Like [`Self::seed_cooldown`] but replaces the existing entry even if it is later (the
+    /// published event is the authority; a replay-derived phase may be wrong).
+    pub fn override_cooldown(&mut self, symbol: &str, direction: Direction, at: DateTime<Utc>) {
+        self.cooldown.set(symbol, direction, at);
     }
 
     pub fn symbol_count(&self) -> usize {
@@ -307,6 +323,53 @@ mod tests {
         assert_eq!(d.stats().suppressed_by_cooldown, 1);
         d.reset_cooldowns();
         assert_eq!(d.observe(&t("A", 3, 111.0, 7), now()).len(), 1);
+    }
+
+    #[test]
+    fn symbol_charset_ascii_graphic_only() {
+        for (sym, ok) in [
+            ("AAPL", true),
+            ("brk.b", true),
+            ("BRK/B", true),
+            (" AAPL", false),
+            ("AA PL", false),
+            ("AAPL\u{200B}", false),
+            ("AAPL\u{202E}", false),
+            ("\u{20AC}", false),
+            ("A\u{7f}", false),
+        ] {
+            let mut d = Detector::new(cfg());
+            d.observe(&t(sym, 1, 100.0, 0), now());
+            assert_eq!(d.symbol_count() == 1, ok, "{sym:?}");
+        }
+    }
+
+    #[test]
+    fn future_dated_symbol_does_not_affect_others_and_recovers_by_processing_time() {
+        let mut d = Detector::new(cfg());
+        let p0 = now();
+        d.observe(&t("QQQ", 1, 100.0, 0), p0);
+        d.observe(&t("POIS", 1, 1.0, 100_000), p0); // far ahead in event time
+        // 1100 trades on other symbols force cleanup passes (>1024 observations).
+        for i in 0..1100 {
+            d.observe(&t(&format!("F{}", i % 50), i + 1, 50.0, 1), p0);
+        }
+        assert_eq!(
+            d.observe(&t("QQQ", 2, 110.0, 5), p0).len(),
+            1,
+            "QQQ unaffected"
+        );
+        // Real trades on POIS are late and do not refresh activity.
+        assert!(d.observe(&t("POIS", 2, 100.0, 10), p0).is_empty());
+        assert_eq!(d.stats().out_of_order, 1);
+        // After > window of processing time with nothing accepted for POIS it is evicted.
+        let later = p0 + Duration::seconds(601);
+        for i in 0..1100 {
+            d.observe(&t(&format!("F{}", i % 50), 5000 + i, 50.0, 2), later);
+        }
+        d.observe(&t("POIS", 3, 100.0, 20), later);
+        let ev = d.observe(&t("POIS", 4, 110.0, 21), later);
+        assert_eq!(ev.len(), 1, "POIS recovered");
     }
 
     #[test]
