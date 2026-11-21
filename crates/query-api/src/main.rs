@@ -1,4 +1,5 @@
 mod alerts;
+mod investigations;
 
 use axum::{
     Json, Router,
@@ -73,6 +74,8 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
+        .route("/investigations", get(investigations::all))
+        .route("/investigations/{event_id}", get(investigations::detail))
         .route("/alerts", get(alerts::all))
         .route("/alerts/{symbol}", get(alerts::symbol))
         .route("/prices/{symbol}", get(get_price))
@@ -84,7 +87,11 @@ async fn main() {
         .unwrap_or_else(|_| "3001".into())
         .parse()
         .expect("PORT must be a valid port number");
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port))
+    let bind_address: std::net::IpAddr = std::env::var("API_BIND_ADDRESS")
+        .unwrap_or_else(|_| "0.0.0.0".into())
+        .parse()
+        .expect("API_BIND_ADDRESS must be a valid IP address");
+    let listener = tokio::net::TcpListener::bind((bind_address, port))
         .await
         .unwrap();
 

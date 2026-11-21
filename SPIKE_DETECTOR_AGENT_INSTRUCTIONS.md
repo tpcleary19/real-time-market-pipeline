@@ -321,6 +321,25 @@ Responsibilities:
 
 Agents should communicate through the orchestration framework, using nonoverlapping assignments wherever practical.
 
+### Agent 5: Skeptic
+
+Responsibilities:
+
+- Assume the code is wrong and try to prove it. Your goal is to find a spike that is lost, duplicated with a different `event_id`, or wrong, or a state in which the service hangs, crashes in a loop or stores an offset before delivery.
+- Do not rely on the other agents' reports or on a green test suite. Reproduce things yourself.
+- Run the real service against a local Kafka broker (see `docs/spike-detector.md` and `docs/spike-detector-testing.md`). Try, for example: kill -9 at awkward moments (mid-publish, mid-warm-up), broker restart or pause during publishing, output topic missing or deleted, rebalance and partition changes, consumer lag and bursts, replay of the same data twice, out-of-order and duplicate trades across a restart, price gaps and thresholds at the exact boundary, huge or garbage payloads, and clock skew.
+- Challenge the design as well as the code: event-time cooldown, f64 prices, at-least-once delivery with warm-up replay, the `latest` default, memory bounds. Say what you would change and why, but do not change it.
+- For each finding give: severity, exact reproduction steps or a test, the observed vs. expected behavior, and the file and line. A finding without a reproduction must be labeled "unverified".
+- Report to the Lead ("Sonnet 5.5 Leader") via SendMessage, ranked by severity. Also say plainly what you tried that did NOT break.
+
+Boundaries:
+
+- Read-only on all source and docs. The only files you may create are in `crates/spike-detector/tests/skeptic_*.rs` and `docs/spike-detector-skeptic.md`. Do not edit any other file, commit to any branch except your own worktree branch, push, or merge.
+- Use your own Kafka broker, ports, topic names and consumer group names (prefix `skeptic-`) so you never touch the Testing agent's or the user's containers. Do not stop, remove or restart existing containers (`market-kafka`, `market-postgres`, `market-redis`). Remove only what you create.
+- Do not add database or PostgreSQL access (see section 16).
+
+Stop condition: stop after one full pass over the list above, or after 90 minutes, whichever is first. Do not keep searching for new issues after that. Send one final report and stop.
+
 ## 11. Agent Execution Rules
 
 Follow these rules throughout development:
