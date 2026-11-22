@@ -834,3 +834,148 @@ async fn skeptic_seed_budget_overflow_keeps_cooldown_phase() {
     e.teardown().await;
     assert_eq!(got, reference, "event ids differ after restart");
 }
+
+// ---- Round 3: attacks on processing-time eviction and seed filtering ----
+
+/// Broker outage longer than the window (window/cooldown 20 s, `docker pause` 30 s on the
+/// skeptic's own container). Trades after the outage continue in event time (backlog), but
+/// idle eviction by processing time has dropped the pre-outage windows and cooldowns:
+/// BASE's spike (baseline 5 s earlier in event time) is lost and COOL fires a second UP
+/// 3 s after its first, inside the cooldown.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn skeptic_broker_outage_keeps_event_time_state() {
+    let container = std::env::var("SKEPTIC_CONTAINER").unwrap_or_else(|_| "skeptic-kafka".into());
+    let cfg = [
+        ("SPIKE_WINDOW_SECONDS", "20"),
+        ("SPIKE_COOLDOWN_SECONDS", "20"),
+    ];
+    let e = Env::new("outage", 1).await;
+    let base = Utc::now() - Cd::seconds(120);
+    send(&e.src, 0, "BASE", 1, 100.0, base).await;
+    send(&e.src, 0, "COOL", 1, 100.0, base).await;
+    send(&e.src, 0, "COOL", 2, 110.0, base + Cd::seconds(1)).await;
+    let c = e.spawn(&cfg);
+    sleep(6);
+    assert!(
+        Command::new("docker")
+            .args(["pause", &container])
+            .status()
+            .unwrap()
+            .success()
+    );
+    sleep(30);
+    assert!(
+        Command::new("docker")
+            .args(["unpause", &container])
+            .status()
+            .unwrap()
+            .success()
+    );
+    sleep(5);
+    // Backlog after the outage: event time continues right where it stopped.
+    let p = producer();
+    let mut futs = Vec::new();
+    for i in 0..1100i64 {
+        let ts = base + Cd::seconds(2);
+        let payload = trade_json(&format!("F{}", i % 50), i + 1, 50.0, ts);
+        futs.push(
+            p.send_result(
+                FutureRecord::to(&e.src)
+                    .key("F")
+                    .partition(0)
+                    .timestamp(ts.timestamp_millis())
+                    .payload(&payload),
+            )
+            .map_err(|x| x.0)
+            .unwrap(),
+        );
+    }
+    for f in futs {
+        f.await.unwrap().map_err(|x| x.0).unwrap();
+    }
+    send(&e.src, 0, "BASE", 2, 106.0, base + Cd::seconds(5)).await;
+    send(&e.src, 0, "COOL", 3, 100.0, base + Cd::seconds(3)).await;
+    send(&e.src, 0, "COOL", 4, 110.0, base + Cd::seconds(4)).await;
+    sleep(6);
+    stop(c);
+    let out: Vec<String> = read_out(&e.out, Duration::from_secs(3))
+        .into_iter()
+        .map(|x| x.event_id)
+        .collect();
+    e.teardown().await;
+    let cool_up = out.iter().filter(|i| i.starts_with("COOL-UP-")).count();
+    let base_up = out.iter().filter(|i| i.starts_with("BASE-UP-")).count();
+    assert_eq!(
+        (base_up, cool_up),
+        (1, 1),
+        "after a 30 s outage: BASE spikes {base_up} (want 1), COOL UPs {cool_up} (want 1): {out:?}"
+    );
+}
+
+/// Crash during fast backlog catch-up: the run before the crash published events whose
+/// event times are far (> skew) beyond the last COMMITTED record. On restart the tail read is
+/// complete, so cooldowns are reset; the per-pair MAX seed is then dropped by the future
+/// filter (> replay time + 300 s), and the older valid published event of the same pair is
+/// lost with it (only the max is kept). The pair restarts with NO cooldown: a new UP fires
+/// 30 s after an already-published UP (cooldown 60 s), with a new event_id.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn skeptic_crash_in_fast_catch_up_keeps_cooldown() {
+    let cfg = [
+        ("SPIKE_WINDOW_SECONDS", "60"),
+        ("SPIKE_COOLDOWN_SECONDS", "60"),
+    ];
+    let base = Utc::now() - Cd::seconds(1500);
+    let trade = |i: i64| (100.0 * 1.01f64.powi(i as i32), base + Cd::seconds(i * 10));
+    let e = Env::new("catchup", 1).await;
+    for i in 0..51 {
+        let (p, ts) = trade(i);
+        send(&e.src, 0, "TRND", i + 1, p, ts).await;
+    }
+    let c = e.spawn(&cfg);
+    sleep(8);
+    assert_eq!(stop(c), Some(0));
+    assert_eq!(e.committed(0), Some(51));
+    for i in 51..100 {
+        let (p, ts) = trade(i);
+        send(&e.src, 0, "TRND", i + 1, p, ts).await;
+    }
+    // Catch up 490 s of event time in well under the 5 s auto-commit interval, then crash.
+    let mut c = e.spawn(&cfg);
+    std::thread::sleep(Duration::from_millis(2500));
+    let _ = c.kill();
+    let _ = c.wait();
+    let before: Vec<SpikeEvent> = read_out(&e.out, Duration::from_secs(3));
+    let committed = e.committed(0);
+    let c = e.spawn(&cfg);
+    sleep(10);
+    stop(c);
+    let all: Vec<SpikeEvent> = read_out(&e.out, Duration::from_secs(3));
+    e.teardown().await;
+    assert_eq!(
+        committed,
+        Some(51),
+        "precondition: crash before auto-commit"
+    );
+    assert!(
+        before.iter().any(|x| x.current_timestamp > trade(80).1),
+        "precondition: pre-crash run published far beyond the commit"
+    );
+    // Union by event_id, sorted by event time: no two UPs closer than the cooldown.
+    let mut seen: Vec<SpikeEvent> = Vec::new();
+    for x in all {
+        if !seen.iter().any(|s| s.event_id == x.event_id) {
+            seen.push(x);
+        }
+    }
+    seen.sort_by_key(|x| x.current_timestamp);
+    for w in seen.windows(2) {
+        assert!(
+            w[1].current_timestamp - w[0].current_timestamp >= Cd::seconds(60),
+            "two UP events inside one cooldown: {} and {}",
+            w[0].event_id,
+            w[1].event_id
+        );
+    }
+}
