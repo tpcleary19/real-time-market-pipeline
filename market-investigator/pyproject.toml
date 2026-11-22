@@ -20,6 +20,7 @@ dependencies = [
 [project.scripts]
 market-investigator = "market_investigator.consumer:main"
 market-investigate = "market_investigator.investigate:main"
+market-investigator-scheduler = "market_investigator.scheduler:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
