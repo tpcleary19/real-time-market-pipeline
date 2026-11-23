@@ -13,7 +13,7 @@ from anthropic import Anthropic
 from dotenv import load_dotenv
 from openai import OpenAI
 import psycopg
-from psycopg.rows import dict_row
+from psycopg.rows import DictRow, dict_row
 from psycopg.types.json import Jsonb
 
 from market_investigator.consumer import SpikeEvent
@@ -193,8 +193,8 @@ def select_job(connection, event_id=None):
     ).fetchone()
 
 
-def claim_job(connection, event_id=None, *, hour_start=None):
-    # Existing callers default to the current UTC hour.
+def claim_job(connection, event_id=None, *, hour_start=None, backfill=False):
+    # The budget hour is independent of event time when filling backlog.
     if hour_start is None:
         hour_start = datetime.now(timezone.utc)
 
@@ -238,10 +238,11 @@ def claim_job(connection, event_id=None, *, hour_start=None):
                 FROM investigation_jobs
                 WHERE status = 'pending'
                   AND (%s::text IS NULL OR event_id = %s)
-                  AND (spike->>'current_timestamp')::timestamptz >= %s
+                  AND (%s::boolean OR
+                       (spike->>'current_timestamp')::timestamptz >= %s)
                   AND (spike->>'current_timestamp')::timestamptz < %s
                 ORDER BY
-                    abs((spike->>'percentage_change')::numeric) DESC,
+                    (spike->>'current_timestamp')::timestamptz,
                     created_at,
                     event_id
                 LIMIT 1
@@ -258,7 +259,7 @@ def claim_job(connection, event_id=None, *, hour_start=None):
             WHERE j.event_id = c.event_id
             RETURNING j.event_id, j.symbol, j.spike
             """,
-            (event_id, event_id, hour_start, hour_end, token, hour_start),
+            (event_id, event_id, backfill, hour_start, hour_end, token, hour_start),
         ).fetchone()
 
         if job is None:
@@ -277,12 +278,14 @@ def claim_job(connection, event_id=None, *, hour_start=None):
 
 
 def run_one(
-    connection, client, model, event_id=None, provider="openai", *, hour_start=None
+    connection, client, model, event_id=None, provider="openai", *,
+    hour_start=None, backfill=False,
 ):
     job, token = claim_job(
         connection,
         event_id,
         hour_start=hour_start,
+        backfill=backfill,
     )
     if job is None:
         return None
@@ -350,7 +353,7 @@ def main():
             f"Set {key_name} in the repository root .env; use --preview to inspect a job first"
         )
     try:
-        with psycopg.connect(
+        with psycopg.Connection[DictRow].connect(
             os.environ["DATABASE_URL"],
             autocommit=True,
             connect_timeout=10,

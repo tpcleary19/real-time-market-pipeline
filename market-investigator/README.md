@@ -50,7 +50,7 @@ The existing `/alerts` endpoints still serve historical `pattern_alerts`; invest
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-Database tests are skipped unless `TEST_DATABASE_URL` points to a separate test database. They use a session-local temporary table and do not modify live alert history. No Kafka broker is needed for these tests; live Kafka-to-database operation must be verified separately.
+Database tests are skipped unless `TEST_DATABASE_URL` points to a separate test database. They use session-local temporary tables or isolated, disposable test schemas and do not modify live application tables. No Kafka broker is needed for these tests; live Kafka-to-database operation must be verified separately.
 
 ## Investigate one job manually
 
@@ -110,3 +110,28 @@ A 404 completes the job with `result.outcome = 'not_found'` and no paid model ca
 This catalog is current metadata, not historical identity verification. It does not validate trade prices, volume, currency, or a news catalyst. Known test-symbol tagging remains a separate improvement: a real ticker can also be used in synthetic test data.
 
 Reference: [Alpaca asset lookup](https://docs.alpaca.markets/us/reference/get-v2-assets-symbol_or_asset_id).
+
+## Scheduled investigations and backlog
+
+Apply `../db/migrations/006_add_investigation_hourly_budget.sql`, reinstall the
+editable package, and run `.venv/bin/market-investigator-scheduler` alongside the
+Kafka intake consumer (`.venv/bin/market-investigator`). Starting the scheduler
+enables paid model requests. Restart it after changing its Python source.
+
+Every 30 seconds the scheduler checks current-hour spikes. One minute after an
+hour closes, it fills that hour's unused slots with the oldest pending spikes
+from any earlier time before that hour's end. Hours use UTC boundaries and
+spike `current_timestamp`; ties use intake time and event ID.
+
+Each hourly budget allows three started attempts, including failures and asset
+lookups that skip model research. Budget reservation and job claiming commit in
+one transaction, so concurrent workers share the limit. Backfill consumes the
+closed hour's allowance, not the current hour's. This is not a rolling 60-minute
+request limit. Only the most recently closed hour is topped up; missed hourly
+allowances from longer outages are not replayed, but their pending jobs remain
+eligible for future backlog fills. Failed and running jobs are not automatically
+retried.
+
+The manual CLI and its read-only preview select current-hour jobs. Research
+requests include both the original event time and the investigation time so
+older backlog events retain historical context.

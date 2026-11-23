@@ -1,4 +1,4 @@
-"""Schedule investigations with a three-attempt budget per event hour."""
+"""Process new spikes and fill unused hourly slots from the oldest backlog."""
 
 from datetime import datetime, timedelta, timezone
 import logging
@@ -11,14 +11,16 @@ from anthropic import Anthropic
 from dotenv import load_dotenv
 from openai import OpenAI
 import psycopg
-from psycopg.rows import dict_row
+from psycopg.rows import DictRow, dict_row
 
 from market_investigator.investigate import provider_settings, run_one
 
 log = logging.getLogger(__name__)
 
 
-def process_hour(connection, client, model, provider, hour_start, stopping):
+def process_hour(
+    connection, client, model, provider, hour_start, stopping, *, backfill=False
+):
     # claim_job enforces the durable limit, including earlier attempts.
     for _ in range(3):
         if stopping.is_set():
@@ -31,6 +33,7 @@ def process_hour(connection, client, model, provider, hour_start, stopping):
                 model,
                 provider=provider,
                 hour_start=hour_start,
+                backfill=backfill,
             )
         except psycopg.Error:
             # Let the outer loop close the connection and reconnect.
@@ -49,6 +52,24 @@ def process_hour(connection, client, model, provider, hour_start, stopping):
             return
 
         log.info("Investigation completed hour=%s", hour_start.isoformat())
+
+
+def process_tick(connection, client, model, provider, stopping):
+    now = datetime.now(timezone.utc)
+    current_hour = now.replace(minute=0, second=0, microsecond=0)
+
+    # Fill unused slots from the last closed hour with older pending work.
+    if now >= current_hour + timedelta(minutes=1):
+        process_hour(
+            connection, client, model, provider,
+            current_hour - timedelta(hours=1), stopping, backfill=True,
+        )
+
+    # Research can take us across an hour boundary; use a fresh clock reading.
+    current_hour = datetime.now(timezone.utc).replace(
+        minute=0, second=0, microsecond=0
+    )
+    process_hour(connection, client, model, provider, current_hour, stopping)
 
 
 def main():
@@ -87,7 +108,7 @@ def main():
 
         while not stopping.is_set():
             try:
-                with psycopg.connect(
+                with psycopg.Connection[DictRow].connect(
                     database_url,
                     autocommit=True,
                     connect_timeout=10,
@@ -96,28 +117,7 @@ def main():
                     connection.execute("SET statement_timeout = '15s'")
                     connection.execute("SET lock_timeout = '10s'")
 
-                    now = datetime.now(timezone.utc)
-                    current_hour = now.replace(minute=0, second=0, microsecond=0)
-
-                    # Give intake one minute to deliver recent events.
-                    if now >= current_hour + timedelta(minutes=1):
-                        process_hour(
-                            connection,
-                            client,
-                            model,
-                            provider,
-                            current_hour - timedelta(hours=1),
-                            stopping,
-                        )
-
-                    process_hour(
-                        connection,
-                        client,
-                        model,
-                        provider,
-                        current_hour,
-                        stopping,
-                    )
+                    process_tick(connection, client, model, provider, stopping)
 
             except psycopg.Error as error:
                 log.error(
