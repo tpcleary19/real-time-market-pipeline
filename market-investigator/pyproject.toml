@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "market-investigator"
+version = "0.1.0"
+description = "Durable intake of market spikes for AI investigation"
+requires-python = ">=3.12"
+dependencies = [
+    "confluent-kafka>=2.12,<3",
+    "psycopg[binary]>=3.2,<4",
+    "pydantic>=2.10,<3",
+    "python-dotenv>=1,<2",
+    "openai>=2,<3",
+    "anthropic>=0.75,<1",
+    "httpx>=0.28,<1",
+]
+
+[project.scripts]
+market-investigator = "market_investigator.consumer:main"
+market-investigate = "market_investigator.investigate:main"
+market-investigator-scheduler = "market_investigator.scheduler:main"
+market-investigator-usage = "market_investigator.usage_report:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

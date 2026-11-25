@@ -2,7 +2,7 @@
 
 > **Status:** Active development
 
-A Rust-based real-time market data pipeline that ingests live equity trades from Alpaca, publishes them through Kafka, persists historical data in PostgreSQL, maintains the latest trade state in Redis, and exposes latest prices, trade history, and pattern alerts through an Axum HTTP API backed by PostgreSQL.
+A Rust-based real-time market data pipeline that ingests live equity trades from Alpaca, publishes them through Kafka, persists historical data in PostgreSQL, maintains the latest trade state in Redis, and exposes latest prices, trade history, and historical alerts through an Axum HTTP API backed by PostgreSQL.
 
 The project is intentionally built as a small distributed system rather than a single application. It is being used to explore event-driven architecture, durable vs. low-latency storage, consumer reliability, backpressure, and operational behavior under load.
 
@@ -15,15 +15,15 @@ flowchart TD
     C --> D[market-consumer]
     D --> E[(PostgreSQL / Neon)]
     D --> F[(Redis latest-state cache)]
-    C --> G[pattern-detector]
-    G --> E
+    C --> G[spike-detector]
+    G --> J[Kafka: price-spikes]
     E --> H[query-api / Cloud Run]
     H --> I[React dashboard]
 ```
 
-PostgreSQL stores durable trades and pattern alerts and serves all current API queries. The consumer also maintains Redis latest-state hashes; the query API has no Redis dependency.
+PostgreSQL stores durable trades and legacy pattern alert history and serves all current API queries. The spike detector publishes new spikes to Kafka; the Python market investigator persists them as jobs and can investigate one manually. Exposing investigation results through the alert API remains future work. The consumer also maintains Redis latest-state hashes; the query API has no Redis dependency.
 
-The query API is deployed on Google Cloud Run with Neon PostgreSQL. Kafka, ingestion, and the pattern detector run independently of the API container. See [deployment instructions](deploy/README.md) and the [dashboard repository](https://github.com/tpcleary19/market-pipeline-dashboard).
+The query API is deployed on Google Cloud Run with Neon PostgreSQL. Kafka, ingestion, and the spike detector run independently of the API container. See [deployment instructions](deploy/README.md) and the [dashboard repository](https://github.com/tpcleary19/market-pipeline-dashboard).
 
 ## Components
 
@@ -75,8 +75,10 @@ Current endpoints:
 | --- | --- | --- |
 | `GET /health` | — | Basic process health response |
 | `GET /ready` | PostgreSQL | Database readiness; 503 on failure |
-| `GET /alerts` | PostgreSQL | Recent pattern alerts |
-| `GET /alerts/{symbol}` | PostgreSQL | Recent alerts for one symbol |
+| `GET /investigations` | PostgreSQL | Recent investigation jobs; filter by symbol/status |
+| `GET /investigations/{event_id}` | PostgreSQL | Saved report, citations, asset lookup, and usage |
+| `GET /alerts` | PostgreSQL | Historical pattern alerts |
+| `GET /alerts/{symbol}` | PostgreSQL | Historical alerts for one symbol |
 | `GET /prices/{symbol}` | PostgreSQL | Latest known trade for a symbol |
 | `GET /trades/{symbol}?limit=N` | PostgreSQL | Most recent historical trades |
 
@@ -112,17 +114,20 @@ The local Docker environment currently uses PostgreSQL 18, Redis 8, and Apache K
 .
 ├── crates/
 │   ├── market-events/
-│   ├── pattern-detector/
+│   ├── spike-detector/
 │   ├── market-producer/
 │   ├── market-consumer/
 │   ├── query-api/
 │   ├── portfolio-domain/
 │   └── load-generator/
+├── market-investigator/
 ├── db/
 │   └── migrations/
 │       ├── 001_create_trades.sql
 │       ├── 002_add_trade_date.sql
-│       └── 003_create_pattern_alerts.sql
+│       ├── 003_create_pattern_alerts.sql
+│       ├── 004_create_investigation_jobs.sql
+│       └── 005_add_investigation_results.sql
 ├── Cargo.toml
 └── docker-compose.yml
 ```
@@ -357,53 +362,22 @@ Scaling improvement:
 Observed bottleneck shift:
 Postgres latency increased from ~1.97 ms to ~2.4 ms
 under three-consumer load, while Redis remained ~0.55 ms.
-## Pattern detector
+## Spike detector
 
-Run `cargo run -p pattern-detector` alongside the existing services. It requires Kafka at localhost:9092 and PostgreSQL. Its independent group `pattern-detector` subscribes to `stock-trades`, receiving its own copy of events without taking messages from the storage consumer. The producer, shared Trade schema, storage consumer, and API are unchanged.
-
-Each symbol has an event-time rolling five-minute window, including the exact five-minute boundary. The newest accepted price is compared with the oldest retained price: (latest - baseline) / baseline. Movement of at least +2% or at most -2% emits a stdout alert immediately; a full five minutes of history is not required. A gap over five minutes establishes a new baseline.
-
-Trades older than the latest accepted timestamp for that symbol are ignored. Equal timestamps retain Kafka arrival order. Invalid prices (nonpositive/nonfinite) and blank symbols are ignored. Duplicate (symbol, New York trade date, trade ID) events are suppressed within the retained window, following the historical store's trading-date convention. Deduplication keys expire with their trades. Continuous above-threshold movement emits once per direction; returning inside the threshold rearms alerts, and a direction change can alert immediately.
-
-Offsets become eligible for periodic Kafka commits only after processing and flushing any alert. Malformed JSON and empty payloads are logged and skipped. Kafka receive/store failures and stdout failures terminate the process. New groups start at latest; existing committed offsets resume normally. Alerts are persisted to PostgreSQL before stdout output and offset storage; see alert persistence below.
-
-State is in memory. Restarts and partition reassignment lose continuity or can repeat alerts; run one detector instance for this initial version. Keep producer messages keyed by symbol. Memory scales with the number of trades in five minutes per active symbol. Inactive symbols retain their last window until the next trade; symbol entries are not evicted. Production use would require checkpointed partition state and a durable idempotent alert sink.
-
-Run `cargo test -p pattern-detector` for tests of thresholds, boundaries, expiry, symbol isolation, trade and alert deduplication, rearming, idle gaps, late events, invalid inputs, date rollover, and shared wire deserialization. No Kafka or databases are required for unit tests.
-
-
-### Alert persistence
-
-Apply the additive migration before restarting the detector:
+The Rust `spike-detector` consumes `stock-trades` and publishes significant price movements to `price-spikes`. It replaces the retired `pattern-detector` service.
 
 ```bash
-docker exec -i market-postgres psql -v ON_ERROR_STOP=1 -U market -d market_data < db/migrations/003_create_pattern_alerts.sql
-cargo run -p pattern-detector
+docker compose up -d kafka kafka-init
+cargo run -p spike-detector
 ```
 
-The detector reads DATABASE_URL from the process environment (it does not load .env), defaulting to the existing local market database. It checks the alerts table before subscribing. Each alert stores symbol, direction, percentage move, baseline/current prices, event-time window start/end, receive time, and triggering Kafka topic/partition/offset. Database failures retry the same alert every two seconds before offset storage; polling can exceed Kafka's session processing limit during a long outage, so this is intended for one detector instance.
+Ensure the `stock-trades` topic exists and run `market-producer` to supply live trades. Defaults are a 5% threshold over a 10-minute window, with a 10-minute cooldown per symbol and direction. See [the spike detector runbook](docs/spike-detector.md) for configuration, synthetic trades, output inspection, and delivery guarantees.
 
-The unique Kafka source position prevents duplicate rows when an insert is retried, including when the database committed but the response was lost. This does not provide exactly-once detection: rolling windows and latches are still in memory, so a restart/rebalance can lose detection context and miss alerts. Stdout can repeat after retries/restarts; the database is the alert history. Previously printed alerts are not backfilled. Checkpointed detector state remains future work.
-
-Inspect recent history:
-
-```sql
-SELECT symbol, direction, movement_percent, baseline_price, price,
-       window_start, event_timestamp
-FROM pattern_alerts
-ORDER BY event_timestamp DESC
-LIMIT 20;
-```
-
-The PostgreSQL round-trip integration test uses a temporary table inside a rolled-back transaction. Run it after applying the migration:
-
-```bash
-TEST_DATABASE_URL=postgres://market:market@localhost:5432/market_data cargo test -p pattern-detector postgres_round_trip -- --ignored
-```
+The detector does not write to PostgreSQL. The [Python market investigator](market-investigator/README.md) consumes `price-spikes` into durable pending investigation jobs; a manual command can generate a cited report, while API integration remains to be implemented. The existing `pattern_alerts` migration and alert endpoints remain available for historical data; they do not receive new spikes.
 
 ### Alert history API
 
-The query API now exposes:
+The query API preserves these historical alert routes:
 - `GET /alerts`: latest alerts across symbols.
 - `GET /alerts/{symbol}`: latest alerts for one symbol (normalized to uppercase).
 
@@ -478,3 +452,36 @@ cargo test --workspace
 ```
 
 Database integration tests are ignored by default and require `TEST_DATABASE_URL`; commands are documented in the relevant sections above. Unit tests do not require live Alpaca credentials. Do not use a production database for integration tests.
+
+
+## Local investigation API development
+
+Investigation results are served by the existing Rust `query-api`. Python consumes spikes, validates assets, and generates reports; HTTP reads do not call Alpaca or a model. The current development workflow runs locally. Deployment remains a separate step after the feature is ready.
+
+Apply migrations 004 and 005 to the database configured by the root `.env`, then from the repository root run:
+
+```bash
+API_BIND_ADDRESS=127.0.0.1 PORT=3001 cargo run -p query-api
+```
+
+This runs the API on loopback while reading the existing configured database (Neon when configured). `API_BIND_ADDRESS` defaults to `0.0.0.0` for the existing container setup; the local command explicitly limits binding to this machine.
+
+```bash
+curl 'http://127.0.0.1:3001/investigations?limit=20'
+curl 'http://127.0.0.1:3001/investigations?symbol=AAPL&status=completed'
+curl 'http://127.0.0.1:3001/investigations/ZZZZ-UP-2-1795203467000000000'
+```
+
+The list returns a JSON array sorted by ingestion time (`created_at`) descending, then `event_id` descending for ties. `limit` defaults to 20 and is clamped to 1–100. `symbol` is trimmed and normalized to uppercase. `status` accepts `pending`, `running`, `completed`, or `failed`; invalid filters return 400. An unmatched list returns `[]`; an unknown detail ID returns 404. Database failures return 500 with a generic error.
+
+List items contain `event_id`, `symbol`, `status`, the original `spike`, job timestamps, `provider`, `model`, `outcome`, and `has_report`. Detail adds `attempts`, `last_error`, and the complete stored `result` (nullable while pending). `result` includes report text, native provider citation/source blocks in `output`, asset lookup context, and usage. Results are returned as saved; the API does not manufacture structured catalyst or evidence scores from prose. A future dashboard must render the citation metadata as inline links. Internal claim tokens and Kafka positions are omitted.
+
+`completed` means job processing finished, including validation-only outcomes such as `not_found`; it does not mean a market explanation was established. Use `outcome` and `provider` to distinguish those from model reports. Historical `/alerts` endpoints continue to read the legacy table.
+
+For route integration tests, use a separate local test database with all migrations applied:
+
+```bash
+TEST_DATABASE_URL=postgres://market:market@localhost:5432/market_data_test cargo test -p query-api -- --include-ignored
+```
+
+The route tests use session-local temporary tables. They must not use the runtime `DATABASE_URL` as a substitute for `TEST_DATABASE_URL`.

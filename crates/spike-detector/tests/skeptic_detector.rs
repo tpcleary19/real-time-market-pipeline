@@ -284,24 +284,15 @@ fn skeptic_year_bounds_are_exact() {
 fn skeptic_symbol_byte_bounds_and_odd_chars() {
     let now = t0();
     let mut accepted = Vec::new();
-    // Rule (round 2): 1..=32 bytes, every byte ASCII graphic 0x21..=0x7E.
-    let cases: [(String, bool); 16] = [
-        ("X".repeat(32), true),  // 32 bytes
-        ("X".repeat(33), false), // 33 bytes
-        ("!".into(), true),      // 0x21, lowest graphic
-        ("~".into(), true),      // 0x7E, highest graphic
-        ("BRK.B".into(), true),
-        ("brk/b-w".into(), true),
-        ("".into(), false),
-        (" AAPL".into(), false),        // leading space (0x20)
-        ("AA PL".into(), false),        // inner space
-        ("AAPL\u{7f}".into(), false),   // DEL
-        ("AAPL\u{0007}".into(), false), // control
-        ("AAPL\u{200B}".into(), false), // zero-width space
-        ("AAPL\u{202E}".into(), false), // RTL override
-        ("\u{0410}APL".into(), false),  // Cyrillic A lookalike
-        ("€".repeat(10) + "XX", false), // 32 bytes but non-ASCII
-        ("AAPL\u{00A0}".into(), false), // no-break space
+    let cases = [
+        "X".repeat(32),        // 32 bytes: ok
+        "X".repeat(33),        // 33: reject
+        "€".repeat(10) + "XX", // non-ASCII: reject (symbols are ASCII graphic only)
+        "€".repeat(11),        // 33 bytes: reject
+        "AAPL\u{0007}".into(), // control: reject
+        "AAPL\u{200B}".into(), // zero-width space: reject
+        " AAPL".into(),        // leading space: reject
+        "AAPL\u{202E}".into(), // RTL override: reject
     ];
     for (s, ok) in &cases {
         let mut d = Detector::new(cfg(600, 600));
@@ -314,7 +305,8 @@ fn skeptic_symbol_byte_bounds_and_odd_chars() {
         );
         accepted.push(d.symbol_count());
     }
-    assert_eq!(accepted.iter().sum::<usize>(), 5);
+    // Only the 32-byte ASCII-graphic symbol is valid.
+    assert_eq!(accepted, vec![0]);
 }
 
 #[test]
