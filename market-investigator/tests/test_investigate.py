@@ -42,6 +42,7 @@ class InvestigationTests(unittest.TestCase):
 
     def test_provider_failure_records_safe_error_and_never_completes(self):
         connection = MagicMock()
+        connection.execute.return_value.rowcount = 1
         job = {"event_id": "test", "symbol": "ZZZZ", "spike": EVENT}
         with patch("market_investigator.investigate.claim_job", return_value=(job, "token")):
             with patch("market_investigator.investigate.request_report", side_effect=RuntimeError("secret detail")):
@@ -54,6 +55,9 @@ class InvestigationTests(unittest.TestCase):
     def test_lost_claim_cannot_overwrite_another_workers_result(self):
         connection = MagicMock()
         connection.execute.return_value.rowcount = 0
+        begin = patch("market_investigator.investigate.begin_model_request")
+        begin.start()
+        self.addCleanup(begin.stop)
         job = {"event_id": "test", "symbol": "ZZZZ", "spike": EVENT}
         with patch("market_investigator.investigate.claim_job", return_value=(job, "token")):
             with patch("market_investigator.investigate.request_report", return_value={"report": "test"}):

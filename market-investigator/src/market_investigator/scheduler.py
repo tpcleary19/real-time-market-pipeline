@@ -34,6 +34,7 @@ def process_hour(
                 provider=provider,
                 hour_start=hour_start,
                 backfill=backfill,
+                trigger="backfill" if backfill else "current_hour",
             )
         except psycopg.Error:
             # Let the outer loop close the connection and reconnect.
@@ -119,6 +120,8 @@ def main():
 
                     process_tick(connection, client, model, provider, stopping)
 
+            except (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn):
+                raise SystemExit("Apply db/migrations/004 through 007 before starting the scheduler") from None
             except psycopg.Error as error:
                 log.error(
                     "Database error; will reconnect: %s",

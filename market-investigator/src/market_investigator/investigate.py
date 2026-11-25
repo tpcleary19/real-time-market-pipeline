@@ -2,7 +2,9 @@
 
 import argparse
 import json
+import logging
 import os
+from time import monotonic
 from pathlib import Path
 import uuid
 
@@ -18,6 +20,13 @@ from psycopg.types.json import Jsonb
 
 from market_investigator.consumer import SpikeEvent
 from market_investigator.assets import lookup_asset
+from market_investigator.usage import (
+    begin_model_request, finish_attempt, pricing_snapshot, record_response,
+)
+
+log = logging.getLogger(__name__)
+CLAIM_TIMEOUT = timedelta(minutes=10)
+MAX_JOB_ATTEMPTS = 3
 
 INSTRUCTIONS = """Investigate the supplied equity price spike using web search.
 
@@ -74,12 +83,34 @@ def build_research_input(event, asset):
     }
 
 
-def request_report(client, model, spike, provider="openai", asset=None):
+def capture_response(response, started, on_response):
+    if on_response is None:
+        return
+    usage = getattr(response, "usage", None)
+    tools = getattr(response, "tool_usage", None)
+    if tools is not None and not isinstance(tools, dict):
+        tools = tools.model_dump(mode="json")
+    raw_usage = usage.model_dump(mode="json") if usage is not None else None
+    tier = getattr(response, "service_tier", None)
+    if tier is None and isinstance(raw_usage, dict):
+        tier = raw_usage.get("service_tier")
+    on_response({
+        "model": response.model,
+        "service_tier": tier,
+        "response_id": response.id,
+        "usage": raw_usage,
+        "tool_usage": tools,
+        "duration_ms": max(0, (monotonic() - started) * 1000),
+    })
+
+
+def request_report(client, model, spike, provider="openai", asset=None, *, on_response=None):
     event = SpikeEvent.model_validate(spike)
     if provider == "anthropic":
-        return request_claude_report(client, model, event, asset)
+        return request_claude_report(client, model, event, asset, on_response=on_response)
     if provider != "openai":
         raise ValueError("Unsupported investigator provider")
+    started = monotonic()
     response = client.responses.create(
         model=model,
         instructions=INSTRUCTIONS,
@@ -91,6 +122,7 @@ def request_report(client, model, spike, provider="openai", asset=None):
         max_output_tokens=5000,
         store=False,
     )
+    capture_response(response, started, on_response)
     if response.status != "completed" or not response.output_text.strip():
         raise RuntimeError("Model did not complete a report")
     # Preserve original text, citation offsets, and tool sources together for rendering.
@@ -105,7 +137,8 @@ def request_report(client, model, spike, provider="openai", asset=None):
     }
 
 
-def request_claude_report(client, model, event, asset=None):
+def request_claude_report(client, model, event, asset=None, *, on_response=None):
+    started = monotonic()
     response = client.messages.create(
         model=model,
         system=INSTRUCTIONS,
@@ -118,6 +151,7 @@ def request_claude_report(client, model, event, asset=None):
         tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}],
         max_tokens=5000,
     )
+    capture_response(response, started, on_response)
     if response.stop_reason != "end_turn":
         # Includes pause_turn and max_tokens: partial output is not a completed report.
         raise RuntimeError("Claude did not complete a report")
@@ -163,6 +197,38 @@ def provider_settings():
     raise ValueError("INVESTIGATOR_PROVIDER must be anthropic or openai")
 
 
+def recover_expired_jobs(connection):
+    """Release expired claims without refunding the original budget reservation."""
+    with connection.transaction():
+        recovered = connection.execute(
+            """
+            WITH expired AS (
+                SELECT event_id, claim_token FROM investigation_jobs
+                WHERE status = 'running'
+                  AND (started_at IS NULL OR started_at < now() - %s)
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE investigation_jobs AS j
+            SET status = CASE WHEN j.attempts >= %s THEN 'failed' ELSE 'pending' END,
+                claim_token = NULL,
+                last_error = CASE WHEN j.attempts >= %s
+                    THEN 'ClaimExpiredAttemptLimit' ELSE 'ClaimExpired' END
+            FROM expired AS e
+            WHERE j.event_id = e.event_id
+            RETURNING j.event_id, j.status, j.attempts, e.claim_token AS expired_token
+            """,
+            (CLAIM_TIMEOUT, MAX_JOB_ATTEMPTS, MAX_JOB_ATTEMPTS),
+        ).fetchall()
+        for job in recovered:
+            finish_attempt(connection, job["expired_token"], "expired", "ClaimExpired")
+    for job in recovered:
+        log.warning(
+            "Expired investigation claim event_id=%s status=%s attempts=%s",
+            job["event_id"], job["status"], job["attempts"],
+        )
+    return recovered
+
+
 def select_job(connection, event_id=None):
     hour_start = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
     hour_end = hour_start + timedelta(hours=1)
@@ -172,6 +238,7 @@ def select_job(connection, event_id=None):
         SELECT event_id, symbol, status, spike
         FROM investigation_jobs
         WHERE status = 'pending'
+          AND attempts < %s
           AND (%s::text IS NULL OR event_id = %s)
           AND (spike->>'current_timestamp')::timestamptz >= %s
           AND (spike->>'current_timestamp')::timestamptz < %s
@@ -189,11 +256,14 @@ def select_job(connection, event_id=None):
             event_id
         LIMIT 1
         """,
-        (event_id, event_id, hour_start, hour_end, hour_start),
+        (MAX_JOB_ATTEMPTS, event_id, event_id, hour_start, hour_end, hour_start),
     ).fetchone()
 
 
-def claim_job(connection, event_id=None, *, hour_start=None, backfill=False):
+def claim_job(
+    connection, event_id=None, *, hour_start=None, backfill=False,
+    provider=None, model=None, trigger=None,
+):
     # The budget hour is independent of event time when filling backlog.
     if hour_start is None:
         hour_start = datetime.now(timezone.utc)
@@ -206,6 +276,11 @@ def claim_job(connection, event_id=None, *, hour_start=None, backfill=False):
     )
     hour_end = hour_start + timedelta(hours=1)
     token = str(uuid.uuid4())
+    trigger = trigger or ("backfill" if backfill else "current_hour")
+    snapshot = pricing_snapshot(provider, model)
+
+    # Recovery commits independently, even if the selected hourly budget is full.
+    recover_expired_jobs(connection)
 
     with connection.transaction():
         connection.execute(
@@ -237,6 +312,7 @@ def claim_job(connection, event_id=None, *, hour_start=None, backfill=False):
                 SELECT event_id
                 FROM investigation_jobs
                 WHERE status = 'pending'
+                  AND attempts < %s
                   AND (%s::text IS NULL OR event_id = %s)
                   AND (%s::boolean OR
                        (spike->>'current_timestamp')::timestamptz >= %s)
@@ -257,13 +333,22 @@ def claim_job(connection, event_id=None, *, hour_start=None, backfill=False):
                 last_error = NULL
             FROM candidate AS c
             WHERE j.event_id = c.event_id
-            RETURNING j.event_id, j.symbol, j.spike
+            RETURNING j.event_id, j.symbol, j.spike, j.attempts
             """,
-            (event_id, event_id, backfill, hour_start, hour_end, token, hour_start),
+            (MAX_JOB_ATTEMPTS, event_id, event_id, backfill, hour_start, hour_end, token, hour_start),
         ).fetchone()
 
         if job is None:
             return None, None
+
+        connection.execute(
+            """INSERT INTO investigation_attempts
+               (claim_token, event_id, attempt_number, budget_hour, trigger,
+                provider, requested_model, pricing_snapshot)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+            (token, job["event_id"], job["attempts"], hour_start, trigger,
+             provider, model, Jsonb(snapshot) if snapshot is not None else None),
+        )
 
         connection.execute(
             """
@@ -279,13 +364,14 @@ def claim_job(connection, event_id=None, *, hour_start=None, backfill=False):
 
 def run_one(
     connection, client, model, event_id=None, provider="openai", *,
-    hour_start=None, backfill=False,
+    hour_start=None, backfill=False, trigger="manual",
 ):
     job, token = claim_job(
         connection,
         event_id,
         hour_start=hour_start,
         backfill=backfill,
+        provider=provider, model=model, trigger=trigger,
     )
     if job is None:
         return None
@@ -306,8 +392,10 @@ def run_one(
                 "usage": None,
             }
         else:
+            begin_model_request(connection, token)
             result = request_report(
-                client, model, job["spike"], provider=provider, asset=asset
+                client, model, job["spike"], provider=provider, asset=asset,
+                on_response=lambda response: record_response(connection, token, response),
             )
             result["asset_lookup"] = asset
         with connection.transaction():
@@ -319,10 +407,13 @@ def run_one(
             )
             if saved.rowcount != 1:
                 raise RuntimeError("Job claim expired or changed; result not saved")
+            outcome = "skipped" if result.get("provider") == "none" else "completed"
+            finish_attempt(connection, token, outcome)
         return result
     except BaseException as error:
         # Keep only the error class: provider errors can contain request details.
         with connection.transaction():
+            finish_attempt(connection, token, "failed", type(error).__name__)
             connection.execute(
                 """UPDATE investigation_jobs SET status = 'failed', last_error = %s,
                    claim_token = NULL
@@ -378,9 +469,9 @@ def main():
             f"Alpaca asset lookup failed (HTTP {error.response.status_code}); "
             "check Alpaca credentials and APCA_API_BASE_URL. No model research was performed."
         ) from None
-    except psycopg.errors.UndefinedColumn:
+    except (psycopg.errors.UndefinedColumn, psycopg.errors.UndefinedTable):
         raise SystemExit(
-            "Apply db/migrations/005_add_investigation_results.sql first"
+            "Apply db/migrations/004 through 007 before running investigations"
         ) from None
     except Exception as error:
         raise SystemExit(

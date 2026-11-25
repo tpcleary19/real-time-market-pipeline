@@ -86,7 +86,7 @@ The report asks the model to verify ticker identity, investigate around the even
 
 The job moves from `pending` to `running` to `completed`, storing the report, source/citation annotations, model/response identifiers, and token usage under `result`. The CLI prints that result as JSON. Any future UI must render the saved citation annotations as clickable inline links. Claude citation blocks and OpenAI citation annotations retain their native formats in `result.output`; `result.provider` identifies the format. This is an initial hosted-tool integration; a Python-controlled tool loop can follow once this path is verified.
 
-Claims are atomic with `FOR UPDATE SKIP LOCKED`. No database transaction is held during the model call. A claim abandoned by a process crash can be reclaimed after ten minutes; claim tokens prevent a stale worker from overwriting a newer result. An expired claim can still cause a duplicate paid request. Handled failures become `failed` with only the error class saved. A paused Claude turn (`pause_turn`), token-limit stop, refusal, or embedded web search error is a failure; this initial command does not issue continuation requests. To retry a failed job intentionally, set its status back to `pending` for that exact `event_id` in the database. Completed jobs are not selected again.
+Claims are atomic with `FOR UPDATE SKIP LOCKED`. No database transaction is held during the model call. A claim abandoned by a process crash can be reclaimed after ten minutes; claim tokens prevent a stale worker from overwriting a newer result. An expired claim can still cause a duplicate paid request. Handled failures become `failed` with only the error class saved. A paused Claude turn (`pause_turn`), token-limit stop, refusal, or embedded web search error is a failure; this initial command does not issue continuation requests. To retry a failed job intentionally, set its status back to `pending` for that exact `event_id` in the database, provided it has fewer than three attempts. Exhausted jobs require manual review rather than automatic retry. Completed jobs are not selected again.
 
 ```sql
 SELECT event_id, symbol, status, attempts, last_error,
@@ -113,7 +113,8 @@ Reference: [Alpaca asset lookup](https://docs.alpaca.markets/us/reference/get-v2
 
 ## Scheduled investigations and backlog
 
-Apply `../db/migrations/006_add_investigation_hourly_budget.sql`, reinstall the
+Apply migrations `006_add_investigation_hourly_budget.sql` and
+`007_create_investigation_attempts.sql` from `../db/migrations/`, reinstall the
 editable package, and run `.venv/bin/market-investigator-scheduler` alongside the
 Kafka intake consumer (`.venv/bin/market-investigator`). Starting the scheduler
 enables paid model requests. Restart it after changing its Python source.
@@ -129,9 +130,104 @@ one transaction, so concurrent workers share the limit. Backfill consumes the
 closed hour's allowance, not the current hour's. This is not a rolling 60-minute
 request limit. Only the most recently closed hour is topped up; missed hourly
 allowances from longer outages are not replayed, but their pending jobs remain
-eligible for future backlog fills. Failed and running jobs are not automatically
-retried.
+eligible for future backlog fills. Handled failures are not automatically retried.
+
+### Crash recovery
+
+Before each claim attempt, expired running jobs return to `pending`. A claim
+expires ten minutes after `started_at` (a running job with no start timestamp is
+also recovered). Clearing its claim token immediately prevents the old worker
+from saving a result or marking a later attempt as failed. Concurrent recovery
+uses row locks and skips locked jobs.
+
+Recovery does not refund an hourly slot. The next attempt must reserve another
+slot through the normal claim path and follows current-hour/backlog eligibility.
+After three total attempts, an expired job becomes `failed` with
+`last_error = 'ClaimExpiredAttemptLimit'`. Requeued jobs record `ClaimExpired`
+until claimed again. Recovery warnings include event ID, resulting status, and
+attempt count. Preview remains read-only and does not run recovery.
+
+This is a fixed claim timeout, not proof that a worker has died. A slow or paused
+worker exceeding ten minutes can be replaced. Its database writes are fenced,
+but a provider request that finished before a crash may be repeated and billed
+again. No heartbeat or provider-side exactly-once guarantee is implemented.
 
 The manual CLI and its read-only preview select current-hour jobs. Research
 requests include both the original event time and the investigation time so
 older backlog events retain historical context.
+
+## Attempt usage and estimated spending
+
+Apply `../db/migrations/007_create_investigation_attempts.sql` before restarting
+investigation workers. Then register the new reporting command:
+
+```bash
+.venv/bin/python -m pip install -e .
+.venv/bin/market-investigator-usage --days 7
+```
+
+The report is read-only; it does not claim jobs, call Alpaca, or call a model.
+Without reinstalling, run `.venv/bin/python -m market_investigator.usage_report --days 7`.
+It includes daily attempt outcomes, known estimated spending, unknown-cost
+counts, usage by provider/model, hourly budget utilization, and pending backlog.
+Dates in the daily report use UTC; decimal costs are rendered as JSON strings.
+Token/search sums cover only recorded values; check the unknown counters.
+Cost per completed report includes the cost of other attempts that day, including
+failures. It is null when any attempt that day has an unknown cost or there are
+no completed reports. Expired attempts have no exact duration; their detection
+time is retained in `finished_at` but excluded from latency averages.
+
+An `investigation_jobs` row is the durable job and final report. Every claim
+creates a separate `investigation_attempts` row keyed by its claim token in the
+same transaction as the job claim and hourly budget reservation. A retry has a
+new row. Each attempt records:
+
+- Job ID, attempt number, budget hour, and current-hour/backfill/manual trigger.
+- Requested provider/model, actual response model and response ID when received.
+- Start, model-request start, response receipt, finish, and observed durations.
+- Running/completed/skipped/failed/expired outcome and a safe error class.
+- Raw provider token/tool usage plus normalized input, output, cache read/write,
+  reasoning tokens, and billable searches when reported.
+- Estimated USD cost, pricing snapshot/version, or a reason the cost is unknown.
+
+Usage is persisted immediately after the provider response, before validating
+its report. Token-limit, refusal, and other incomplete responses therefore
+retain reported usage even though the job fails. If a model request times out or
+its worker crashes, usage/cost remains unknown unless a response was durably
+recorded. A late worker may update its own expired attempt's usage but cannot
+change the expired outcome or the newer job claim. An asset-validation skip or
+failure before the model request has known zero model/search cost, distinct from
+missing usage. This does not account for infrastructure or Alpaca costs.
+
+`usage.py` contains versioned standard synchronous/global list rates checked on
+2026-11-23 for `claude-sonnet-5-5` and `gpt-5-mini` (including its documented dated
+snapshot). Sources: [Claude pricing](https://platform.claude.com/docs/en/about-claude/pricing),
+[GPT-5 mini pricing](https://developers.openai.com/api/docs/models/gpt-5-mini), and
+[OpenAI search pricing](https://developers.openai.com/api/docs/pricing).
+Each attempt stores its rates; later code/rate changes do not rewrite old estimates.
+Add an explicit pricing entry/version when choosing another model. Unknown
+models, missing billable search counts, and unsupported cache pricing produce
+null costs with an explanation, rather than guessed totals. Claude's cache
+reads/writes are separate from its input tokens; OpenAI's cached input is a subset
+of input tokens and reasoning is a subset of output. Neither is double-counted.
+OpenAI search counts come from reported `tool_usage.web_search.num_requests`,
+not from counting output blocks. Older responses/SDKs may not expose that count.
+These estimates exclude account discounts, taxes, and nonstandard service tiers;
+compare them with provider billing. Usage tracking does not add a daily spending
+limit.
+
+Tracking begins with claims created by this version. Historical attempts and
+requests started by an older worker are not reconstructed. Restart all workers
+after applying the migration. Avoid resetting job attempt counters: the ledger
+keeps a unique `(event_id, attempt_number)` for the complete recorded history.
+
+To inspect recent attempts directly:
+
+```sql
+SELECT event_id, attempt_number, trigger, outcome, requested_model,
+       input_tokens, output_tokens, billable_searches,
+       estimated_cost_usd, cost_status, cost_unknown_reason, duration_ms
+FROM investigation_attempts
+ORDER BY started_at DESC
+LIMIT 20;
+```

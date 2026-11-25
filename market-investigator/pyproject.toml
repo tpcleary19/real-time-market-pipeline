@@ -21,6 +21,7 @@ dependencies = [
 market-investigator = "market_investigator.consumer:main"
 market-investigate = "market_investigator.investigate:main"
 market-investigator-scheduler = "market_investigator.scheduler:main"
+market-investigator-usage = "market_investigator.usage_report:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
