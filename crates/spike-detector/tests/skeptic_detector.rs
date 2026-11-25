@@ -184,7 +184,6 @@ fn skeptic_crash_after_publish_does_not_yield_second_event_inside_cooldown() {
 /// symbols of the lagging partition lose their window and cooldown state mid-stream, and a
 /// spike that is inside its cooldown is emitted again with a new event_id.
 #[test]
-#[ignore = "documented limitation: global event-time watermark (docs/spike-detector.md Known limitations)"]
 fn skeptic_lagging_partition_keeps_cooldown_when_another_partition_runs_ahead() {
     let mut d = Detector::new(cfg(600, 600));
     let now = t0();
@@ -295,12 +294,16 @@ fn skeptic_symbol_byte_bounds_and_odd_chars() {
         " AAPL".into(),        // leading space: reject
         "AAPL\u{202E}".into(), // RTL override: reject
     ];
-    for (i, s) in cases.iter().enumerate() {
+    for (s, ok) in &cases {
         let mut d = Detector::new(cfg(600, 600));
         d.observe(&trade(s, 1, 100.0, 0), now);
-        if d.symbol_count() == 1 {
-            accepted.push(i);
-        }
+        assert_eq!(d.symbol_count() == 1, *ok, "symbol {s:?}");
+        assert_eq!(
+            d.stats().invalid,
+            u64::from(!ok),
+            "symbol {s:?} counted invalid"
+        );
+        accepted.push(d.symbol_count());
     }
     // Only the 32-byte ASCII-graphic symbol is valid.
     assert_eq!(accepted, vec![0]);
@@ -313,4 +316,40 @@ fn skeptic_trade_id_extremes() {
     let e = d.observe(&trade("I", i64::MAX, 110.0, 1), t0());
     assert_eq!(e.len(), 1);
     assert!(e[0].event_id.starts_with(&format!("I-UP-{}-", i64::MAX)));
+}
+
+// ---- Round 3: processing-time eviction ----
+
+/// Idle eviction now runs on PROCESSING time. If consumption stalls for longer than the
+/// window (broker outage, long GC/pause, network partition) while event times do not move,
+/// the first cleanup after the stall evicts every symbol not yet touched since the stall,
+/// even though their windows and cooldowns are still current in event time.
+/// (a) a baseline that is 5 s old in event time is gone, so a real spike is lost;
+/// (b) a cooldown 3 s old in event time is pruned, so a second UP fires inside the cooldown.
+#[test]
+fn skeptic_processing_stall_keeps_event_time_state() {
+    let mut d = Detector::new(cfg(600, 600));
+    let p0 = t0() + Duration::days(1);
+    // Before the stall.
+    d.observe(&trade("BASE", 1, 100.0, 0), p0);
+    d.observe(&trade("COOL", 1, 100.0, 0), p0);
+    assert_eq!(d.observe(&trade("COOL", 2, 110.0, 1), p0).len(), 1);
+    // Consumption resumes 11 minutes later (processing time); event times continue.
+    let p1 = p0 + Duration::seconds(660);
+    for i in 0..1100 {
+        d.observe(&trade(&format!("F{}", i % 50), i + 1, 50.0, 2), p1);
+    }
+    let lost = d.observe(&trade("BASE", 2, 106.0, 5), p1);
+    let mut dup = d.observe(&trade("COOL", 3, 100.0, 3), p1);
+    dup.extend(d.observe(&trade("COOL", 4, 110.0, 4), p1));
+    assert_eq!(
+        lost.len(),
+        1,
+        "BASE: 6% move 5 s after baseline not detected"
+    );
+    assert!(
+        dup.is_empty(),
+        "COOL: UP re-emitted 3 s (event time) after the first UP: {:?}",
+        ids(&dup)
+    );
 }
